@@ -1,0 +1,118 @@
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from pathlib import Path
+
+"""
+ConvNeXt fine‑tuning pipeline **with label smoothing**
+-----------------------------------------------------
+• Uses ConvNeXt backbone with built‑in Normalization (expects [0‑255] float inputs).
+• Applies heavier label smoothing for initial training, lighter during fine‑tune.
+• **NEW:** Automatically writes `class_names.txt` next to the saved model so the
+  inference script can pick it up without manual bookkeeping (one class name
+  per line, matching the training order).
+
+Tested with TF‑Keras ≥ 2.19.
+"""
+
+# ---------------------------- CONFIGURATION ----------------------------------
+DATA_ROOT = Path("./IndyZooFaces")       # folder with sub‑dirs per class
+VAL_SPLIT = 0.15                       # validation fraction
+IMG_SIZE   = (224, 224)
+BATCH_SIZE = 32
+
+LABEL_SMOOTH_INIT = 0.10               # heavier for warm‑up
+LABEL_SMOOTH_FINE = 0.05               # lighter for fine‑tune
+
+EPOCHS_INIT = 10
+EPOCHS_FINE = 10
+
+MODEL_OUT      = Path("convnext_finetuned_labelsmooth.keras")
+CLASS_NAMES_TXT = MODEL_OUT.with_suffix(".classes.txt")
+
+AUTOTUNE = tf.data.AUTOTUNE
+# -----------------------------------------------------------------------------
+
+# 1️⃣  Dataset -----------------------------------------------------------------
+
+def build_dataset(root: Path, validation_split: float = 0.0, subset: str | None = None):
+    """Return (dataset, class_names)."""
+    ds = tf.keras.utils.image_dataset_from_directory(
+        root,
+        labels="inferred",
+        label_mode="int",               # integers → we will one‑hot
+        validation_split=validation_split if subset else None,
+        subset=subset,
+        seed=1337,
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        interpolation="bicubic",
+        shuffle=True,
+    )
+
+    class_names = tuple(ds.class_names)  # immutable copy
+    num_classes = len(class_names)
+
+    # Cast to float32 (keep 0‑255 range) and one‑hot encode labels for CCE.
+    ds = ds.map(
+        lambda x, y: (tf.cast(x, tf.float32), tf.one_hot(y, num_classes)),
+        num_parallel_calls=AUTOTUNE,
+    )
+    return ds.cache().prefetch(AUTOTUNE), class_names
+
+train_ds, CLASS_NAMES = build_dataset(DATA_ROOT, VAL_SPLIT, "training")
+val_ds, _             = build_dataset(DATA_ROOT, VAL_SPLIT, "validation")
+NUM_CLASSES = len(CLASS_NAMES)
+
+# 2️⃣  Persist class names ------------------------------------------------------
+CLASS_NAMES_TXT.write_text("\n".join(CLASS_NAMES) + "\n", encoding="utf‑8")
+print(f"Saved class names → {CLASS_NAMES_TXT.resolve()}")
+
+# 3️⃣  Model -------------------------------------------------------------------
+backbone = keras.applications.ConvNeXtBase(
+    include_top=False,
+    weights="imagenet",
+    include_preprocessing=True,   # built‑in Normalization layer
+    input_shape=IMG_SIZE + (3,),
+    pooling="avg",               # global average pool
+)
+
+x = layers.Dropout(0.2)(backbone.output)
+outputs = layers.Dense(NUM_CLASSES, activation="softmax")(x)
+model = keras.Model(backbone.input, outputs, name="convnext_finetune")
+
+# 4️⃣  Compile & initial training ---------------------------------------------
+loss_init = keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTH_INIT)
+model.compile(
+optimizer = keras.optimizers.AdamW(
+    learning_rate=1e-4,
+    weight_decay=0.05,          
+    beta_1=0.9,
+    beta_2=0.999,
+),
+    loss=loss_init,
+    metrics=["accuracy"],
+)
+
+model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_INIT)
+
+# 5️⃣  Fine‑tuning -------------------------------------------------------------
+backbone.trainable = True  # unfreeze
+loss_fine = keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTH_FINE)
+model.compile(
+optimizer = keras.optimizers.AdamW(
+    learning_rate=1e-5,
+    weight_decay=0.05,          # try 0.02–0.05 grid-search
+    beta_1=0.9,
+    beta_2=0.999,
+),   # lower LR for fine‑tune
+    loss=loss_fine,
+    metrics=["accuracy"],
+)
+
+model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FINE)
+
+# 6️⃣  Save --------------------------------------------------------------------
+model.save(MODEL_OUT)
+print(f"Model saved → {MODEL_OUT.resolve()}")
+print("Training complete ✔️")
