@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""convnext_infer_notebook.py — **Notebook‑friendly** batch inference helper for the fine‑tuned ConvNeXt model.
+
+Hard‑coded variables at the top mean you can simply run the cell to get
+predictions for every image in `INPUT_DIR`. Adjust any of the constants and
+re‑run to change behaviour.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import List
+import csv
+
+import numpy as np
+import tensorflow as tf
+
+# ----------------------------- USER SETTINGS ---------------------------------
+IMG_SIZE        = (224, 224)                          # must match training
+BATCH_SIZE      = 32
+MODEL_PATH      = Path("convnext_finetuned_labelsmooth.keras")
+INPUT_DIR       = Path("./test_images")          
+CLASS_NAMES_TXT = Path("convnext_finetuned_labelsmooth.classes.txt")          
+TOP_K           = 3               # top‑k predictions to return
+OUTPUT_CSV      = None            # e.g. Path("predictions.csv") or None
+AUTOTUNE        = tf.data.AUTOTUNE
+# -----------------------------------------------------------------------------
+
+# 1️⃣  Utility functions --------------------------------------------------------
+
+
+def load_class_names(path: Path | None, num_classes: int) -> List[str]:
+    if path and path.exists():
+        names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if len(names) != num_classes:
+            raise ValueError(
+                f"Class name count ({len(names)}) does not match model outputs ({num_classes})."
+            )
+        return names
+    return [f"class_{i}" for i in range(num_classes)]
+
+
+def preprocess_image(path: tf.Tensor) -> tf.Tensor:
+    """Read > decode > resize > cast float32 keeping [0‑255] range."""
+    img = tf.io.read_file(path)
+    img = tf.image.decode_image(img, channels=3, expand_animations=False)
+    img = tf.image.resize(img, IMG_SIZE, method="bilinear", antialias=True)
+    img = tf.cast(img, tf.float32)  # still 0‑255 → Normalization layer handles scaling
+    return img
+
+
+def build_dataset(file_paths: List[str]) -> tf.data.Dataset:
+    ds = tf.data.Dataset.from_tensor_slices(file_paths)
+    ds = ds.map(preprocess_image, num_parallel_calls=AUTOTUNE)
+    return ds.batch(BATCH_SIZE).prefetch(AUTOTUNE)
+
+# 2️⃣  Collect image files ------------------------------------------------------
+img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif"}
+files = sorted(str(p) for p in INPUT_DIR.rglob("*") if p.suffix.lower() in img_exts)
+if not files:
+    raise FileNotFoundError(f"No images found in {INPUT_DIR.resolve()}")
+print(f"Found {len(files)} images → running inference …")
+
+# 3️⃣  Load model --------------------------------------------------------------
+model: tf.keras.Model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+num_classes = model.output_shape[-1]
+class_names = load_class_names(CLASS_NAMES_TXT, num_classes)
+
+# 4️⃣  Run inference -----------------------------------------------------------
+probs = model.predict(build_dataset(files), verbose=1)
+TOP_K = max(1, min(TOP_K, num_classes))
+rank = np.argsort(-probs, axis=1)[:, :TOP_K]
+
+results: List[tuple[str, List[tuple[str, float]]]] = []
+for i, path in enumerate(files):
+    preds = [(class_names[idx], float(probs[i, idx])) for idx in rank[i]]
+    results.append((Path(path).name, preds))
+
+# 5️⃣  Display -----------------------------------------------------------------
+for filename, preds in results:
+    best_cls, best_prob = preds[0]
+    extra = ", ".join(f"{c}:{p:.2%}" for c, p in preds[1:]) if TOP_K > 1 else ""
+    print(f"{filename:30s} → {best_cls:<15s} {best_prob:.2%} {extra}")
+
+# 6️⃣  Optional CSV ------------------------------------------------------------
+if OUTPUT_CSV:
+    header = ["image"] + [f"top{i+1}_class" for i in range(TOP_K)] + [f"top{i+1}_prob" for i in range(TOP_K)]
+    with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for filename, preds in results:
+            flat = [x for tup in preds for x in tup]
+            writer.writerow([filename] + flat)
+    print(f"CSV saved to {OUTPUT_CSV.resolve()}")
