@@ -1,6 +1,7 @@
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
+import keras_cv
 from pathlib import Path
 
 """
@@ -31,6 +32,7 @@ MODEL_OUT      = Path("convnext_finetuned_labelsmooth.keras")
 CLASS_NAMES_TXT = MODEL_OUT.with_suffix(".classes.txt")
 
 AUTOTUNE = tf.data.AUTOTUNE
+RAND_AUG = keras_cv.layers.RandAugment(value_range=(0, 255))
 # -----------------------------------------------------------------------------
 
 # 1️⃣  Dataset -----------------------------------------------------------------
@@ -63,6 +65,12 @@ def build_dataset(root: Path, validation_split: float = 0.0, subset: str | None 
 train_ds, CLASS_NAMES = build_dataset(DATA_ROOT, VAL_SPLIT, "training")
 val_ds, _             = build_dataset(DATA_ROOT, VAL_SPLIT, "validation")
 NUM_CLASSES = len(CLASS_NAMES)
+
+# Apply RandAugment only on the training dataset
+train_ds = train_ds.map(
+    lambda x, y: (RAND_AUG(x, training=True), y),
+    num_parallel_calls=AUTOTUNE,
+).prefetch(AUTOTUNE)
 
 # 2️⃣  Persist class names ------------------------------------------------------
 CLASS_NAMES_TXT.write_text("\n".join(CLASS_NAMES) + "\n", encoding="utf‑8")
