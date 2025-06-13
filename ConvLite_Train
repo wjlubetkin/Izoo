@@ -68,6 +68,7 @@ NUM_CLASSES = len(CLASS_NAMES)
 
 # Apply RandAugment only on the training dataset
 train_ds = train_ds.map(
+
     lambda x, y: (
         tf.cast(
             RAND_AUG(tf.cast(x, tf.uint8), training=True),
@@ -75,6 +76,7 @@ train_ds = train_ds.map(
         ),
         y,
     ),
+
     num_parallel_calls=AUTOTUNE,
 ).prefetch(AUTOTUNE)
 
