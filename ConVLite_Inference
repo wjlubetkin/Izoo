@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """convnext_infer_notebook.py — **Notebook‑friendly** batch inference helper for the fine‑tuned ConvNeXt model.
 
-Hard‑coded variables at the top mean you can simply run the cell to get
+Hard‑coded variables at the top mean we can simply run the cell to get
 predictions for every image in `INPUT_DIR`. Adjust any of the constants and
 re‑run to change behaviour.
 """
@@ -21,12 +21,12 @@ BATCH_SIZE      = 32
 MODEL_PATH      = Path("convnext_finetuned_labelsmooth.keras")
 INPUT_DIR       = Path("./test_images")          
 CLASS_NAMES_TXT = Path("convnext_finetuned_labelsmooth.classes.txt")          
-TOP_K           = 3               # top‑k predictions to return
+TOP_K           = 1               # top‑k predictions to return
 OUTPUT_CSV      = None            # e.g. Path("predictions.csv") or None
 AUTOTUNE        = tf.data.AUTOTUNE
 # -----------------------------------------------------------------------------
 
-# 1️⃣  Utility functions --------------------------------------------------------
+# Utility functions --------------------------------------------------------
 
 
 def load_class_names(path: Path | None, num_classes: int) -> List[str]:
@@ -54,19 +54,19 @@ def build_dataset(file_paths: List[str]) -> tf.data.Dataset:
     ds = ds.map(preprocess_image, num_parallel_calls=AUTOTUNE)
     return ds.batch(BATCH_SIZE).prefetch(AUTOTUNE)
 
-# 2️⃣  Collect image files ------------------------------------------------------
+# Collect image files ------------------------------------------------------
 img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif"}
 files = sorted(str(p) for p in INPUT_DIR.rglob("*") if p.suffix.lower() in img_exts)
 if not files:
     raise FileNotFoundError(f"No images found in {INPUT_DIR.resolve()}")
 print(f"Found {len(files)} images → running inference …")
 
-# 3️⃣  Load model --------------------------------------------------------------
+# Load model --------------------------------------------------------------
 model: tf.keras.Model = tf.keras.models.load_model(MODEL_PATH, compile=False)
 num_classes = model.output_shape[-1]
 class_names = load_class_names(CLASS_NAMES_TXT, num_classes)
 
-# 4️⃣  Run inference -----------------------------------------------------------
+# Run inference -----------------------------------------------------------
 probs = model.predict(build_dataset(files), verbose=1)
 TOP_K = max(1, min(TOP_K, num_classes))
 rank = np.argsort(-probs, axis=1)[:, :TOP_K]
@@ -76,13 +76,13 @@ for i, path in enumerate(files):
     preds = [(class_names[idx], float(probs[i, idx])) for idx in rank[i]]
     results.append((Path(path).name, preds))
 
-# 5️⃣  Display -----------------------------------------------------------------
+# Display -----------------------------------------------------------------
 for filename, preds in results:
     best_cls, best_prob = preds[0]
     extra = ", ".join(f"{c}:{p:.2%}" for c, p in preds[1:]) if TOP_K > 1 else ""
     print(f"{filename:30s} → {best_cls:<15s} {best_prob:.2%} {extra}")
 
-# 6️⃣  Optional CSV ------------------------------------------------------------
+# Optional CSV ------------------------------------------------------------
 if OUTPUT_CSV:
     header = ["image"] + [f"top{i+1}_class" for i in range(TOP_K)] + [f"top{i+1}_prob" for i in range(TOP_K)]
     with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as f:
