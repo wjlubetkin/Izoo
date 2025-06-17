@@ -35,7 +35,7 @@ AUTOTUNE = tf.data.AUTOTUNE
 RAND_AUG = keras_cv.layers.RandAugment(value_range=(0, 255))
 # -----------------------------------------------------------------------------
 
-# 1️⃣  Dataset -----------------------------------------------------------------
+# Dataset -----------------------------------------------------------------
 
 def build_dataset(root: Path, validation_split: float = 0.0, subset: str | None = None):
     """Return (dataset, class_names)."""
@@ -80,11 +80,11 @@ train_ds = train_ds.map(
     num_parallel_calls=AUTOTUNE,
 ).prefetch(AUTOTUNE)
 
-# 2️⃣  Persist class names ------------------------------------------------------
+# Persist class names ------------------------------------------------------
 CLASS_NAMES_TXT.write_text("\n".join(CLASS_NAMES) + "\n", encoding="utf‑8")
 print(f"Saved class names → {CLASS_NAMES_TXT.resolve()}")
 
-# 3️⃣  Model -------------------------------------------------------------------
+# Model -------------------------------------------------------------------
 backbone = keras.applications.ConvNeXtBase(
     include_top=False,
     weights="imagenet",
@@ -97,7 +97,7 @@ x = layers.Dropout(0.2)(backbone.output)
 outputs = layers.Dense(NUM_CLASSES, activation="softmax")(x)
 model = keras.Model(backbone.input, outputs, name="convnext_finetune")
 
-# 4️⃣  Compile & initial training ---------------------------------------------
+# Compile & initial training ---------------------------------------------
 loss_init = keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTH_INIT)
 model.compile(
 optimizer = keras.optimizers.AdamW(
@@ -112,13 +112,13 @@ optimizer = keras.optimizers.AdamW(
 
 model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_INIT)
 
-# 5️⃣  Fine‑tuning -------------------------------------------------------------
+# Fine‑tuning -------------------------------------------------------------
 backbone.trainable = True  # unfreeze
 loss_fine = keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTH_FINE)
 model.compile(
 optimizer = keras.optimizers.AdamW(
     learning_rate=1e-5,
-    weight_decay=0.05,          # try 0.02–0.05 grid-search
+    weight_decay=0.05,          # We want to try 0.02–0.05 grid-search eventually
     beta_1=0.9,
     beta_2=0.999,
 ),   # lower LR for fine‑tune
@@ -128,7 +128,7 @@ optimizer = keras.optimizers.AdamW(
 
 model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FINE)
 
-# 6️⃣  Save --------------------------------------------------------------------
+# Save --------------------------------------------------------------------
 model.save(MODEL_OUT)
 print(f"Model saved → {MODEL_OUT.resolve()}")
-print("Training complete ✔️")
+print("Training complete!")
