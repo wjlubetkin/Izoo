@@ -1,0 +1,269 @@
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from pathlib import Path
+import os
+
+def load_and_preprocess_image(image_path, target_size=(224, 224)):
+    """
+    Load and preprocess a single image for ConvNeXt
+    Note: ConvNeXtBase with include_preprocessing=True expects [0-255] float inputs
+    """
+    # Load image
+    img = Image.open(image_path)
+    
+    # Convert to RGB if needed
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    
+    # Resize
+    img = img.resize(target_size)
+    
+    # Convert to array - keep in [0, 255] range since your model has include_preprocessing=True
+    img_array = np.array(img, dtype=np.float32)
+    
+    # Add batch dimension
+    img_array = np.expand_dims(img_array, axis=0)  # Shape: (1, 224, 224, 3)
+    
+    return img_array
+
+def get_convnext_layer_names(model):
+    """
+    Select the most informative layers for visualization based on your ConvNeXt architecture
+    """
+    # Based on your layer list, here are the key representative layers:
+    selected_layers = [
+        # Early feature extraction (low-level features like edges, textures)
+        'convnext_base_stem',                              # Very first conv layer after preprocessing
+        
+        # Stage 0 - Early features (3 blocks total)
+        'convnext_base_stage_0_block_2_identity',          # End of stage 0
+        
+        # Stage 1 - Low-to-mid level features (3 blocks total) 
+        'convnext_base_stage_1_block_2_identity',          # End of stage 1
+        
+        # Stage 2 - Mid-level features (27 blocks total - this is the big stage)
+        'convnext_base_stage_2_block_13_identity',         # Middle of stage 2
+        'convnext_base_stage_2_block_26_identity',         # End of stage 2
+        
+        # Stage 3 - High-level features (3 blocks total)
+        'convnext_base_stage_3_block_2_identity',          # End of stage 3 (final conv features)
+        
+        # Final classification layers
+        'global_average_pooling2d',                      # Pooled features before classification
+        'dropout',                                       # After dropout (same as pooling but shows effect)
+        'dense'                                          # Final classification layer
+    ]
+    
+    print("Selected layers for analysis:")
+    for i, name in enumerate(selected_layers):
+        stage_info = {
+            'convnext_base_stem': 'Initial conv stem (very early features)',
+            'convnext_base_stage_0_block_2_identity': 'End of Stage 0 (early features)', 
+            'convnext_base_stage_1_block_2_identity': 'End of Stage 1 (low-mid features)',
+            'convnext_base_stage_2_block_13_identity': 'Middle of Stage 2 (mid-level features)',
+            'convnext_base_stage_2_block_26_identity': 'End of Stage 2 (high-mid features)', 
+            'convnext_base_stage_3_block_2_identity': 'End of Stage 3 (high-level features)',
+            'global_average_pooling2d_2': 'Global pooled features',
+            'dropout_2': 'Pre-classification features',
+            'dense_2': 'Final classification outputs'
+        }
+        print(f"  {i+1}. {name} - {stage_info.get(name, '')}")
+    
+    return selected_layers
+
+def get_layer_activations(model, layer_names, input_image):
+    """
+    Extract activations from specified layers
+    """
+    try:
+        activation_model = tf.keras.Model(
+            inputs=model.input,
+            outputs=[model.get_layer(name).output for name in layer_names]
+        )
+        activations = activation_model(input_image)
+        return activations
+    except Exception as e:
+        print(f"Error getting activations: {e}")
+        print("Available layer names:")
+        for layer in model.layers:
+            print(f"  {layer.name}")
+        return None
+
+def plot_single_image_activation_comparison(original_model, finetuned_model, 
+                                          layer_names, test_image, image_name="test_image"):
+    """
+    Compare activations for a single image across both models
+    """
+    # Get activations from both models
+    print("Getting activations from original model...")
+    orig_activations = get_layer_activations(original_model, layer_names, test_image)
+    
+    print("Getting activations from fine-tuned model...")
+    fine_activations = get_layer_activations(finetuned_model, layer_names, test_image)
+    
+    if orig_activations is None or fine_activations is None:
+        return
+    
+    # Create the comparison plot
+    fig, axes = plt.subplots(len(layer_names), 4, figsize=(20, 5*len(layer_names)))
+    
+    # Show the input image in the first row
+    if len(layer_names) > 0:
+        # Denormalize image for display (since we're keeping [0-255] range)
+        display_img = test_image[0] / 255.0  # Convert to [0,1] for display
+        display_img = np.clip(display_img, 0, 1)
+        
+        axes[0, 0].imshow(display_img)
+        axes[0, 0].set_title(f'Input Image: {image_name}')
+        axes[0, 0].axis('off')
+    
+    for i, layer_name in enumerate(layer_names):
+        print(f"Processing layer {i+1}/{len(layer_names)}: {layer_name}")
+        
+        # Get activations for this layer
+        orig_acts = orig_activations[i]
+        fine_acts = fine_activations[i]
+        
+        print(f"  Activation shape: {orig_acts.shape}")
+        
+        # Process activations based on their dimensionality
+        if len(orig_acts.shape) == 4:  # Conv layer: (1, height, width, channels)
+            # Average across spatial dimensions to get per-channel response
+            orig_summary = np.mean(orig_acts[0], axis=(0, 1))  # Shape: (channels,)
+            fine_summary = np.mean(fine_acts[0], axis=(0, 1))
+            ylabel = 'Avg Activation per Channel'
+            xlabel = 'Channel Index'
+        elif len(orig_acts.shape) == 2:  # Dense layer: (1, units)
+            orig_summary = orig_acts[0]  # Shape: (units,)
+            fine_summary = fine_acts[0]
+            ylabel = 'Activation per Neuron'
+            xlabel = 'Neuron Index'
+        else:
+            print(f"  Unexpected activation shape: {orig_acts.shape}")
+            continue
+        
+        # Skip first column for layers after the first (already used for input image)
+        col_offset = 1 if i == 0 else 0
+        
+        # Plot original model activations
+        axes[i, col_offset].plot(orig_summary, color='blue', alpha=0.7)
+        axes[i, col_offset].set_title(f'{layer_name}\nOriginal Model')
+        axes[i, col_offset].set_xlabel(xlabel)
+        axes[i, col_offset].set_ylabel(ylabel)
+        axes[i, col_offset].grid(True, alpha=0.3)
+        
+        # Plot fine-tuned model activations
+        axes[i, col_offset+1].plot(fine_summary, color='orange', alpha=0.7)
+        axes[i, col_offset+1].set_title(f'{layer_name}\nFine-tuned Model')
+        axes[i, col_offset+1].set_xlabel(xlabel)
+        axes[i, col_offset+1].set_ylabel(ylabel)
+        axes[i, col_offset+1].grid(True, alpha=0.3)
+        
+        # Plot difference
+        diff = fine_summary - orig_summary
+        axes[i, col_offset+2].plot(diff, color='red', alpha=0.7)
+        axes[i, col_offset+2].set_title(f'{layer_name}\nDifference (Fine-tuned - Original)')
+        axes[i, col_offset+2].set_xlabel(xlabel)
+        axes[i, col_offset+2].set_ylabel('Activation Difference')
+        axes[i, col_offset+2].axhline(y=0, color='black', linestyle='--', alpha=0.5)
+        axes[i, col_offset+2].grid(True, alpha=0.3)
+        
+        # Add statistics
+        print(f"  Original - Mean: {np.mean(orig_summary):.4f}, Std: {np.std(orig_summary):.4f}")
+        print(f"  Fine-tuned - Mean: {np.mean(fine_summary):.4f}, Std: {np.std(fine_summary):.4f}")
+        print(f"  Difference - Mean: {np.mean(diff):.4f}, Max abs: {np.max(np.abs(diff)):.4f}")
+    
+    # Hide unused subplots
+    for i in range(len(layer_names)):
+        for j in range(4):
+            if i == 0 and j == 0:  # Keep input image
+                continue
+            elif j < (1 if i == 0 else 0) or j > (3 if i == 0 else 2):
+                axes[i, j].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+def create_original_convnext_base(num_classes):
+    """
+    Create the original ConvNeXtBase model with the same architecture as your fine-tuned model
+    but with ImageNet weights (before your training)
+    """
+    backbone = tf.keras.applications.ConvNeXtBase(
+        include_top=False,
+        weights="imagenet",
+        include_preprocessing=True,   # built-in Normalization layer
+        input_shape=(224, 224, 3),
+        pooling="avg",               # global average pool
+    )
+    
+    # Add the same custom head as your training script
+    x = tf.keras.layers.Dropout(0.2)(backbone.output)
+    outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    model = tf.keras.Model(backbone.input, outputs, name="convnext_original")
+    
+    return model
+
+def load_class_names(model_path):
+    """
+    Load class names from the .classes.txt file that your training script creates
+    """
+    classes_file = model_path.replace('.keras', '.classes.txt')
+    try:
+        with open(classes_file, 'r', encoding='utf-8') as f:
+            class_names = [line.strip() for line in f if line.strip()]
+        return class_names
+    except FileNotFoundError:
+        print(f"Warning: Could not find {classes_file}")
+        print("Please specify the number of classes manually")
+        return None
+
+def analyze_convnext_activations(finetuned_model_path, image_path, num_classes=None):
+    """
+    Main function to run the analysis
+    """
+    print("Loading fine-tuned model...")
+    finetuned_model = tf.keras.models.load_model(finetuned_model_path)
+    
+    # Try to get number of classes automatically
+    if num_classes is None:
+        class_names = load_class_names(finetuned_model_path)
+        if class_names:
+            num_classes = len(class_names)
+            print(f"Detected {num_classes} classes: {class_names}")
+        else:
+            # Fallback: get from model output shape
+            num_classes = finetuned_model.output.shape[-1]
+            print(f"Inferred {num_classes} classes from model output shape")
+    
+    print("Creating original ConvNeXt model with ImageNet weights...")
+    original_model = create_original_convnext_base(num_classes)
+    
+    print("Loading and preprocessing image...")
+    test_image = load_and_preprocess_image(image_path)
+    
+    print("Identifying layers to analyze...")
+    layer_names = get_convnext_layer_names(original_model)
+    
+    # You can also manually specify layers if you prefer:
+    # layer_names = ['stem_conv', 'stage_1_block_0_conv', 'stage_3_block_2_conv', 'head_dense']
+    
+    print("Comparing activations...")
+    image_name = os.path.basename(image_path)
+    plot_single_image_activation_comparison(
+        original_model, finetuned_model, layer_names, test_image, image_name
+    )
+    
+    print("Analysis complete!")
+
+# Usage example:
+if __name__ == "__main__":
+    # Update this path to match your fine-tuned model
+    finetuned_model_path = "convnext_finetuned_labelsmooth.keras"
+    image_path = Path("./x")  # Your test image
+    
+    # The function will automatically detect number of classes from your .classes.txt file
+    # or you can specify manually: analyze_convnext_activations(finetuned_model_path, image_path, num_classes=10)
+    analyze_convnext_activations(finetuned_model_path, image_path)
