@@ -65,9 +65,9 @@ def get_convnext_layer_names(model):
             'convnext_base_stage_2_block_13_identity': 'Middle of Stage 2 (mid-level features)',
             'convnext_base_stage_2_block_26_identity': 'End of Stage 2 (high-mid features)', 
             'convnext_base_stage_3_block_2_identity': 'End of Stage 3 (high-level features)',
-            'global_average_pooling2d_2': 'Global pooled features',
-            'dropout_2': 'Pre-classification features',
-            'dense_2': 'Final classification outputs'
+            'global_average_pooling2d': 'Global pooled features',
+            'dropout': 'Pre-classification features',
+            'dense': 'Final classification outputs'
         }
         print(f"  {i+1}. {name} - {stage_info.get(name, '')}")
     
