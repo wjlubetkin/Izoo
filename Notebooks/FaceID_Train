@@ -1,0 +1,94 @@
+DATASET_ROOT = "/ChimpfaceID.v1i.yolov5-obb"  
+MODEL_BASE   = "yolov8m-obb.pt"                     
+
+# ============================================================
+# 1 – Install / imports
+# ============================================================
+import subprocess, sys, importlib, shutil, os, yaml
+from pathlib import Path
+def _pip(pkg):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-Uq", pkg], check=True)
+for pkg in ("ultralytics", "Pillow", "tqdm"):
+    try: importlib.import_module(pkg)
+    except ImportError: _pip(pkg)
+
+from PIL import Image
+from tqdm import tqdm
+from ultralytics import YOLO
+
+root = Path(DATASET_ROOT).expanduser().resolve()
+assert root.exists(), f"{root} not found"
+
+# ============================================================
+# 2 – Convert labelTxt ➜ labels (class name ➜ index, px ➜ [0,1])
+# ============================================================
+for split in ("train", "valid", "test"):
+    lt_dir = root / split / "labelTxt"
+    if not lt_dir.exists(): continue                                  # test/ may be absent
+    lab_dir = root / split / "labels"
+    lab_dir.mkdir(exist_ok=True)
+
+    for txt_path in tqdm(list(lt_dir.glob("*.txt")), desc=f"{split}"):
+        # find corresponding image to get width / height
+        img_name = txt_path.stem
+        for ext in (".jpg", ".jpeg", ".png"):
+            img_path = root / split / "images" / f"{img_name}{ext}"
+            if img_path.exists(): break
+        else:
+            print(f"⚠️  image for {txt_path.name} not found, skipping")
+            continue
+
+        w, h = Image.open(img_path).size
+        out_path = lab_dir / txt_path.name
+        with txt_path.open() as f_in, out_path.open("w") as f_out:
+            for line in f_in:
+                parts = line.strip().split()
+                if len(parts) < 8:                    # malformed row
+                    continue
+                # first 8 tokens are coordinates; the rest are class & difficulty
+                coords_px = list(map(float, parts[:8]))
+                coords_n  = [coords_px[i] / w if i % 2 == 0 else coords_px[i] / h
+                             for i in range(8)]
+                f_out.write("0 " + " ".join(f"{c:.6g}" for c in coords_n) + "\n")
+
+# ============================================================
+# 3 – Write data YAML
+# ============================================================
+yaml_path = root / "chimpface_obb.yaml"
+yaml_path.write_text(yaml.dump(dict(
+    path = str(root),
+    train= "train/images",
+    val  = "valid/images",
+    nc   = 1,
+    names= ["chimp_face"],
+)))
+print(f"✓ Wrote {yaml_path.relative_to(root)}")
+
+# ============================================================
+# 4 – Sanity-check & train
+# ============================================================
+model = YOLO(MODEL_BASE)
+
+print("\nRunning quick sanity-check…")
+model.val(data=str(yaml_path), imgsz=640, batch=4, plots=False)    # should show ≥1 label per image
+
+print("\nStarting training ⏳")
+results = model.train(
+    data      = str(yaml_path),
+    epochs    = 160,
+    imgsz     = 640,
+    batch     = 16,
+    workers   = 8,
+    optimizer = "SGD",
+    project   = "chimp_face_yolo8_obb",
+    name      = "exp2",
+    # built-in augmentation knobs
+    hsv_h=0.015, hsv_s=0.4, hsv_v=0.4,
+    degrees=30, translate=0.1, scale=0.2, shear=1.2,
+    mosaic=1.0, fliplr=0.5, flipud=0.1,
+    mixup=0.0,
+)
+
+print("\nFinal validation:")
+metrics = model.val(data=str(yaml_path), imgsz=640, batch=8)
+print("mAP50-95:", metrics.box.map)
