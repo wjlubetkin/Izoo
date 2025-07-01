@@ -1,0 +1,49 @@
+from pathlib import Path
+import yaml
+from ultralytics import YOLO
+
+ROOT          = Path(DATASET_ROOT).expanduser().resolve()
+YAML_FILE     = ROOT / "chimpface_obb.yaml"
+BEST_CHECKPT  = Path("chimp_face_yolo8_obb/exp2/weights/best.pt")   # adjust if you renamed exp
+INFER_FOLDER  = "/chimp_groups"    # <— change to the folder you want to batch-predict
+
+# -- 1. ensure the yaml knows about test/images
+data_cfg = yaml.safe_load(YAML_FILE.read_text())
+if "test" not in data_cfg:
+    data_cfg["test"] = "test/images"
+    YAML_FILE.write_text(yaml.dump(data_cfg))
+    print("✓ Added test split to yaml")
+
+# -- 2. reload the best checkpoint
+model = YOLO(str(BEST_CHECKPT))
+
+# quick check: do we have labels for test?
+test_label_dir = ROOT / "test" / "labels"
+print(f"Found {len(list(test_label_dir.glob('*.txt')))} label files in test/")
+
+print("\n▶ Evaluating on test set …")
+metrics_test = model.val(
+    data  = str(YAML_FILE),
+    split = "test",          # uses test/images + test/labels
+    imgsz = 640,
+    batch = 8,
+)
+print(f"mAP50-95 (test): {metrics_test.box.map:.4f}")
+
+# -- 3. Batch inference on an arbitrary folder
+print(f"\n▶ Running inference on {INFER_FOLDER} …")
+pred = model.predict(
+    source    = INFER_FOLDER,   # single image, folder, or wildcard "*.jpg"
+    imgsz     = 640,
+    conf      = 0.25,           # adjust confidence threshold
+    save      = True,           # saves annotated images to runs/predict/
+    save_txt  = True,           # writes OBB labels to runs/predict/labels
+    save_conf = True,           # appends confidence to txt
+    stream    = False,          # set True if you want a generator
+)
+print(f"✓ Predictions saved under {pred[0].save_dir}")
+
+# -- optional: display first five predictions inline (Jupyter only)
+from IPython.display import Image as IPyImage, display
+for im in list(Path(pred[0].save_dir).glob("*.jpg"))[:5]:
+    display(IPyImage(filename=str(im)))
