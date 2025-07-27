@@ -1,7 +1,6 @@
 """
 Chimp Face Detection + Recognition Pipeline with YOLOv8
-Combines YOLOv8 OBB face detection with ConvNeXt facial recognition
-Supports streaming video input
+Modified for video file processing with temporal aggregation
 """
 
 from __future__ import annotations
@@ -12,30 +11,24 @@ import tensorflow as tf
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 from ultralytics import YOLO
 import warnings
+from collections import defaultdict, Counter
+import pandas as pd
 warnings.filterwarnings('ignore')
 
 # Configure TensorFlow GPU settings
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
     try:
-        # Method 1: Allow memory growth
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
     except RuntimeError as e:
         print(f"GPU configuration error: {e}")
 
-# Alternative: Limit GPU memory usage
-# tf.config.experimental.set_virtual_device_configuration(
-#     gpus[0],
-#     [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=2048)]
-# )
-
 # ----------------------------- CONFIGURATION ---------------------------------
 # YOLOv8 Model Settings
-YOLO_MODEL_PATH = Path("chimp_face_yolo8_obb/exp2/weights/best.pt")
+YOLO_MODEL_PATH = Path("best.pt")
 YOLO_CONF_THRESHOLD = 0.25
 YOLO_IMG_SIZE = 640
 
@@ -45,18 +38,24 @@ CONVNEXT_MODEL_PATH = Path("convnext_finetuned_labelsmooth.keras")
 CLASS_NAMES_TXT = Path("convnext_finetuned_labelsmooth.classes.txt")
 TOP_K = 3
 
-# Streaming Settings
-STREAM_SOURCE = 0  # 0 for webcam, or URL for IP camera/RTSP stream
-DISPLAY_FPS = True
-SAVE_DETECTIONS = False  # Save detected face crops
-OUTPUT_DIR = Path("./streaming_detections")
+# Temporal aggregation settings
+TIME_WINDOW = 5.0  # seconds - adjust this to change window length
+CONFIDENCE_THRESHOLD = 0.5  # minimum confidence to count a prediction
 
-# Create output directory if saving detections
-if SAVE_DETECTIONS:
-    OUTPUT_DIR.mkdir(exist_ok=True)
+# Manual color mapping (add custom colors here)
+IDENTITY_COLORS = {
+    'Cathy': 'green',
+    # Add more identity-color mappings as needed
+     'Arthur': 'blue',
+     'Lucy'  : 'red',
+     'Sue'   : 'purple',
+     'Evelyne': 'orange',
+     'Unknown': 'grey',
+    
+}
 # -----------------------------------------------------------------------------
 
-class ChimpFaceStreamingPipeline:
+class ChimpFaceVideoPipeline:
     def __init__(self):
         # Initialize YOLOv8 model
         print("Loading YOLOv8 model...")
@@ -65,7 +64,6 @@ class ChimpFaceStreamingPipeline:
         # Load ConvNeXt model with error handling
         print("Loading ConvNeXt model...")
         try:
-            # Try loading with GPU support
             self.convnext_model = tf.keras.models.load_model(CONVNEXT_MODEL_PATH, compile=False)
         except Exception as e:
             print(f"GPU loading failed: {e}")
@@ -76,9 +74,9 @@ class ChimpFaceStreamingPipeline:
         self.num_classes = self.convnext_model.output_shape[-1]
         self.class_names = self._load_class_names()
         
-        # Frame counter for FPS calculation
-        self.frame_count = 0
-        self.detection_count = 0
+        # Storage for temporal analysis
+        self.frame_predictions = []  # List of (timestamp, predictions) tuples
+        self.window_predictions = []  # List of (window_start, window_end, identity) tuples
         
     def _load_class_names(self) -> List[str]:
         """Load class names from file or generate defaults."""
@@ -90,11 +88,7 @@ class ChimpFaceStreamingPipeline:
         return [f"chimp_{i}" for i in range(self.num_classes)]
     
     def detect_faces_yolo(self, image: np.ndarray) -> List[Dict]:
-        """
-        Detect faces using YOLOv8 OBB model.
-        Returns list of detections with bounding boxes and confidence scores.
-        """
-        # Run YOLOv8 inference
+        """Detect faces using YOLOv8 OBB model."""
         results = self.yolo_model.predict(
             source=image,
             imgsz=YOLO_IMG_SIZE,
@@ -107,7 +101,7 @@ class ChimpFaceStreamingPipeline:
         if results and len(results) > 0:
             result = results[0]
             
-            # Handle OBB (Oriented Bounding Box) detections
+            # Handle OBB detections
             if hasattr(result, 'obb') and result.obb is not None:
                 boxes = result.obb.xyxy.cpu().numpy() if hasattr(result.obb, 'xyxy') else []
                 confs = result.obb.conf.cpu().numpy() if hasattr(result.obb, 'conf') else []
@@ -115,12 +109,12 @@ class ChimpFaceStreamingPipeline:
                 for i, (box, conf) in enumerate(zip(boxes, confs)):
                     x1, y1, x2, y2 = map(int, box)
                     detections.append({
-                        'bbox': (x1, y1, x2-x1, y2-y1),  # (x, y, width, height)
+                        'bbox': (x1, y1, x2-x1, y2-y1),
                         'confidence': float(conf),
-                        'obb_box': box  # Keep original OBB data
+                        'obb_box': box
                     })
             
-            # Fallback to regular bounding boxes if OBB not available
+            # Fallback to regular bounding boxes
             elif hasattr(result, 'boxes') and result.boxes is not None:
                 boxes = result.boxes.xyxy.cpu().numpy()
                 confs = result.boxes.conf.cpu().numpy()
@@ -141,21 +135,17 @@ class ChimpFaceStreamingPipeline:
         for det in detections:
             x, y, w, h = det['bbox']
             
-            # Add some padding around the face
-            padding = 0.1  # 10% padding
+            # Add padding
+            padding = 0.1
             pad_x = int(w * padding)
             pad_y = int(h * padding)
             
-            # Expand bounding box with padding
             x1 = max(0, x - pad_x)
             y1 = max(0, y - pad_y)
             x2 = min(image.shape[1], x + w + pad_x)
             y2 = min(image.shape[0], y + h + pad_y)
             
-            # Extract crop
             crop = image[y1:y2, x1:x2]
-            
-            # Resize to model input size
             crop_resized = cv2.resize(crop, IMG_SIZE)
             crops.append(crop_resized)
             
@@ -166,7 +156,6 @@ class ChimpFaceStreamingPipeline:
         if not crops:
             return np.array([])
         
-        # Convert to float32 and keep in 0-255 range
         processed = np.array(crops, dtype=np.float32)
         return processed
     
@@ -175,19 +164,15 @@ class ChimpFaceStreamingPipeline:
         if not face_crops:
             return []
         
-        # Preprocess crops
         input_batch = self.preprocess_for_convnext(face_crops)
         
         try:
-            # Run inference
             predictions = self.convnext_model.predict(input_batch, verbose=0)
         except Exception as e:
             print(f"Inference error: {e}")
-            # Fallback to CPU inference
             with tf.device('/CPU:0'):
                 predictions = self.convnext_model.predict(input_batch, verbose=0)
         
-        # Get top-k predictions for each face
         top_k = min(TOP_K, self.num_classes)
         rank = np.argsort(-predictions, axis=1)[:, :top_k]
         
@@ -198,139 +183,256 @@ class ChimpFaceStreamingPipeline:
         
         return results
     
-    def draw_results_on_frame(self, frame: np.ndarray, detections: List[Dict], 
-                             predictions: List[List[Tuple[str, float]]]) -> np.ndarray:
-        """Draw bounding boxes and predictions on the frame."""
-        annotated_frame = frame.copy()
+    def aggregate_predictions_in_window(self, predictions: List[Tuple[float, List[Tuple[str, float]]]]) -> str:
+        """
+        Aggregate predictions within a time window using majority voting.
+        Only count predictions above confidence threshold.
+        """
+        vote_counts = Counter()
         
-        for i, (det, preds) in enumerate(zip(detections, predictions)):
-            x, y, w, h = det['bbox']
-            conf = det['confidence']
-            
-            # Draw bounding box
-            cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            
-            # Prepare label
-            if preds:
-                best_class, best_prob = preds[0]
-                label = f"{best_class} ({best_prob:.1%}) | YOLO: {conf:.1%}"
-            else:
-                label = f"Face {i+1} | YOLO: {conf:.1%}"
-            
-            # Draw label background
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(annotated_frame, (x, y - 20), (x + label_size[0], y), (0, 255, 0), -1)
-            
-            # Draw label text
-            cv2.putText(annotated_frame, label, (x, y - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        for timestamp, frame_preds in predictions:
+            for preds_list in frame_preds:
+                if preds_list:  # If there are predictions for this face
+                    # Get the top prediction
+                    best_class, best_conf = preds_list[0]
+                    if best_conf >= CONFIDENCE_THRESHOLD:
+                        vote_counts[best_class] += 1
         
-        return annotated_frame
+        if vote_counts:
+            # Return the class with most votes
+            return vote_counts.most_common(1)[0][0]
+        else:
+            return "Unknown"
     
-    def process_stream(self, source=None):
-        """Process video stream with face detection and recognition."""
-        # Use provided source or default
-        stream_source = source if source is not None else STREAM_SOURCE
-        
-        # Open video stream
-        print(f"Opening video stream: {stream_source}")
-        cap = cv2.VideoCapture(stream_source)
+    def process_video(self, video_path: str, save_sample_frames: bool = False):
+        """Process entire video file with temporal aggregation."""
+        cap = cv2.VideoCapture(video_path)
         
         if not cap.isOpened():
-            raise ValueError(f"Failed to open video stream: {stream_source}")
+            raise ValueError(f"Failed to open video: {video_path}")
         
-        # Get stream properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        if fps == 0:
-            fps = 30  # Default FPS if not available
+        # Get video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = total_frames / fps
         
-        print("Starting stream processing... Press 'q' to quit")
-        print("Press 's' to save current detections")
+        print(f"Video properties:")
+        print(f"  FPS: {fps}")
+        print(f"  Total frames: {total_frames}")
+        print(f"  Duration: {video_duration:.2f} seconds")
+        print(f"  Time window: {TIME_WINDOW} seconds")
         
-        frame_time = cv2.getTickCount()
+        # Clear previous results
+        self.frame_predictions = []
+        self.window_predictions = []
         
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    print("Failed to read frame or end of stream")
-                    break
-                
-                self.frame_count += 1
-                
-                # Detect faces with YOLOv8
-                detections = self.detect_faces_yolo(frame)
-                
-                # Extract face crops and run recognition if faces detected
-                predictions = []
-                if detections:
-                    face_crops = self.extract_face_crops(frame, detections)
-                    predictions = self.recognize_faces(face_crops)
-                    self.detection_count += len(detections)
-                
-                # Draw results on frame
-                annotated_frame = self.draw_results_on_frame(frame, detections, predictions)
-                
-                # Calculate and display FPS
-                if DISPLAY_FPS:
-                    current_time = cv2.getTickCount()
-                    fps_calc = cv2.getTickFrequency() / (current_time - frame_time)
-                    frame_time = current_time
-                    
-                    fps_text = f"FPS: {fps_calc:.1f} | Faces: {len(detections)}"
-                    cv2.putText(annotated_frame, fps_text, (10, 30),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                
-                # Display frame
-                cv2.imshow("Chimp Face Detection Stream", annotated_frame)
-                
-                # Handle keyboard input
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('s') and SAVE_DETECTIONS and detections:
-                    # Save detected faces
-                    timestamp = cv2.getTickCount()
-                    for i, (det, crop) in enumerate(zip(detections, face_crops)):
-                        filename = f"face_{timestamp}_{i}.jpg"
-                        cv2.imwrite(str(OUTPUT_DIR / filename), crop)
-                    print(f"Saved {len(detections)} face(s)")
-                
-        except KeyboardInterrupt:
-            print("\nStream interrupted by user")
+        frame_count = 0
+        current_window_start = 0.0
+        current_window_predictions = []
         
-        finally:
-            # Cleanup
-            cap.release()
-            cv2.destroyAllWindows()
+        print("\nProcessing video...")
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
             
-            # Print summary
-            print(f"\n=== STREAM SUMMARY ===")
-            print(f"Total frames processed: {self.frame_count}")
-            print(f"Total faces detected: {self.detection_count}")
-            if self.frame_count > 0:
-                print(f"Average faces per frame: {self.detection_count/self.frame_count:.2f}")
-
-# Example usage functions
-def stream_from_webcam():
-    """Stream from default webcam."""
-    pipeline = ChimpFaceStreamingPipeline()
-    pipeline.process_stream(0)
-
-def stream_from_ip_camera(url: str):
-    """Stream from IP camera or RTSP stream."""
-    pipeline = ChimpFaceStreamingPipeline()
-    pipeline.process_stream(url)
-
-def stream_from_video_file(video_path: str):
-    """Process a video file as a stream."""
-    pipeline = ChimpFaceStreamingPipeline()
-    pipeline.process_stream(video_path)
-
-# Main execution
-if __name__ == "__main__":
-    # Initialize pipeline
-    pipeline = ChimpFaceStreamingPipeline()
+            timestamp = frame_count / fps
+            
+            # Process frame
+            detections = self.detect_faces_yolo(frame)
+            predictions = []
+            
+            if detections:
+                face_crops = self.extract_face_crops(frame, detections)
+                predictions = self.recognize_faces(face_crops)
+            
+            # Store frame predictions with timestamp
+            if predictions:
+                self.frame_predictions.append((timestamp, predictions))
+                current_window_predictions.append((timestamp, predictions))
+            
+            # Check if we've completed a time window
+            if timestamp - current_window_start >= TIME_WINDOW:
+                # Aggregate predictions for this window
+                if current_window_predictions:
+                    window_identity = self.aggregate_predictions_in_window(current_window_predictions)
+                    self.window_predictions.append(
+                        (current_window_start, current_window_start + TIME_WINDOW, window_identity)
+                    )
+                
+                # Move to next window
+                current_window_start += TIME_WINDOW
+                current_window_predictions = []
+            
+            frame_count += 1
+            
+            # Progress update
+            if frame_count % 30 == 0:
+                progress = (frame_count / total_frames) * 100
+                print(f"  Progress: {progress:.1f}% ({frame_count}/{total_frames} frames)")
+        
+        # Process final window if it has data
+        if current_window_predictions:
+            window_identity = self.aggregate_predictions_in_window(current_window_predictions)
+            self.window_predictions.append(
+                (current_window_start, timestamp, window_identity)
+            )
+        
+        cap.release()
+        
+        print(f"\nProcessing complete!")
+        print(f"  Total frames processed: {frame_count}")
+        print(f"  Total time windows: {len(self.window_predictions)}")
+        
+        return self.window_predictions
     
-    # Start streaming from default source
-    pipeline.process_stream()
+    def plot_cumulative_votes(self, save_path: Optional[str] = None):
+        """Create a visualization of cumulative votes over time."""
+        if not self.window_predictions:
+            print("No predictions to plot!")
+            return
+        
+        # Prepare data for plotting
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), 
+                                       gridspec_kw={'height_ratios': [3, 1]})
+        
+        # Top plot: Cumulative votes over time
+        # Define color function with manual override option
+        def get_identity_color(name):
+            """Get color for an identity - manual mapping or consistent auto-generated."""
+            if name in IDENTITY_COLORS:
+                return IDENTITY_COLORS[name]
+            # Fallback to hash-based color
+            hash_value = hash(name)
+            color_index = abs(hash_value) % 20
+            return plt.cm.tab20(color_index / 20.0)
+        
+        # Count votes per identity across all windows
+        identity_votes = defaultdict(list)
+        time_points = []
+        
+        cumulative_counts = defaultdict(int)
+        
+        for window_start, window_end, identity in self.window_predictions:
+            window_center = (window_start + window_end) / 2
+            time_points.append(window_center)
+            
+            cumulative_counts[identity] += 1
+            
+            for id_name in self.class_names:
+                identity_votes[id_name].append(cumulative_counts[id_name])
+        
+        # Plot cumulative votes
+        for identity, votes in identity_votes.items():
+            if max(votes) > 0:  # Only plot identities that received votes
+                ax1.plot(time_points, votes, marker='o', label=identity, 
+                        linewidth=2, color=get_identity_color(identity))
+        
+        ax1.set_xlabel('Time (seconds)')
+        ax1.set_ylabel('Cumulative Votes')
+        ax1.set_title('Cumulative Identity Votes Over Time')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Bottom plot: Identity timeline
+        # Create color map using manual colors when available
+        def get_identity_color(name):
+            """Get color for an identity - manual mapping or consistent auto-generated."""
+            if name in IDENTITY_COLORS:
+                return IDENTITY_COLORS[name]
+            # Fallback to hash-based color
+            hash_value = hash(name)
+            color_index = abs(hash_value) % 20
+            return plt.cm.tab20(color_index / 20.0)
+        
+        unique_identities = list(set([pred[2] for pred in self.window_predictions]))
+        identity_colors = {identity: get_identity_color(identity) for identity in unique_identities}
+        
+        # Plot time windows
+        for window_start, window_end, identity in self.window_predictions:
+            ax2.barh(0, window_end - window_start, left=window_start, 
+                    height=0.8, color=identity_colors[identity], 
+                    edgecolor='black', linewidth=1)
+            
+            # Add text label in the middle of each window (vertically oriented)
+            window_center = (window_start + window_end) / 2
+            ax2.text(window_center, 0, identity, 
+                    ha='center', va='center', fontsize=8, 
+                    rotation=90,  # Rotate text 90 degrees
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
+        
+        ax2.set_xlabel('Time (seconds)')
+        ax2.set_ylim(-0.5, 0.5)
+        ax2.set_yticks([])
+        ax2.set_title('Identity Timeline (Time Windows)')
+        ax2.grid(True, axis='x', alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"Plot saved to: {save_path}")
+        
+        plt.show()
+    
+    def get_summary_statistics(self) -> pd.DataFrame:
+        """Generate summary statistics of the video analysis."""
+        if not self.window_predictions:
+            return pd.DataFrame()
+        
+        # Count occurrences of each identity
+        identity_counts = Counter([pred[2] for pred in self.window_predictions])
+        
+        # Calculate time spent for each identity
+        identity_time = defaultdict(float)
+        for window_start, window_end, identity in self.window_predictions:
+            identity_time[identity] += (window_end - window_start)
+        
+        # Create summary dataframe
+        summary_data = []
+        for identity in identity_counts:
+            summary_data.append({
+                'Identity': identity,
+                'Window Count': identity_counts[identity],
+                'Total Time (s)': identity_time[identity],
+                'Percentage': (identity_time[identity] / sum(identity_time.values())) * 100
+            })
+        
+        df = pd.DataFrame(summary_data)
+        df = df.sort_values('Total Time (s)', ascending=False)
+        
+        return df
+
+# Example usage
+def analyze_video(video_path: str, time_window: float = 5.0, confidence_threshold: float = 0.5):
+    """
+    Analyze a video file with the chimp face recognition pipeline.
+    
+    Args:
+        video_path: Path to the video file
+        time_window: Length of time windows in seconds
+        confidence_threshold: Minimum confidence for predictions to count
+    """
+    global TIME_WINDOW, CONFIDENCE_THRESHOLD
+    TIME_WINDOW = time_window
+    CONFIDENCE_THRESHOLD = confidence_threshold
+    
+    # Initialize pipeline
+    pipeline = ChimpFaceVideoPipeline()
+    
+    # Process video
+    window_predictions = pipeline.process_video(video_path)
+    
+    # Generate visualizations
+    pipeline.plot_cumulative_votes(save_path="cumulative_votes.png")
+    
+    # Get summary statistics
+    summary = pipeline.get_summary_statistics()
+    print("\n=== SUMMARY STATISTICS ===")
+    print(summary.to_string(index=False))
+    
+    return pipeline, window_predictions, summary
+
+# Usage in Jupyter:
+# pipeline, predictions, summary = analyze_video("path/to/your/video.mp4", time_window=5.0)
