@@ -1,0 +1,280 @@
+DATASET_ROOT = "/ChimpfaceID.v2i.yolov8-obb"  
+MODEL_BASE   = "yolov8m-obb.pt"                     
+
+# ============================================================
+# 1 – Install / imports
+# ============================================================
+import subprocess, sys, importlib, shutil, os, yaml, json
+from pathlib import Path
+from datetime import datetime
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def _pip(pkg):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-Uq", pkg], check=True)
+for pkg in ("ultralytics", "Pillow", "tqdm", "matplotlib", "pandas"):
+    try: importlib.import_module(pkg)
+    except ImportError: _pip(pkg)
+
+from PIL import Image
+from tqdm import tqdm
+from ultralytics import YOLO
+
+root = Path(DATASET_ROOT).expanduser().resolve()
+assert root.exists(), f"{root} not found"
+
+# ============================================================
+# 2 – Convert labelTxt ➜ labels (class name ➜ index, px ➜ [0,1])
+# ============================================================
+for split in ("train", "valid", "test"):
+    lt_dir = root / split / "labelTxt"
+    if not lt_dir.exists(): continue                                  # test/ may be absent
+    lab_dir = root / split / "labels"
+    lab_dir.mkdir(exist_ok=True)
+
+    for txt_path in tqdm(list(lt_dir.glob("*.txt")), desc=f"{split}"):
+        # find corresponding image to get width / height
+        img_name = txt_path.stem
+        for ext in (".jpg", ".jpeg", ".png"):
+            img_path = root / split / "images" / f"{img_name}{ext}"
+            if img_path.exists(): break
+        else:
+            print(f"⚠️  image for {txt_path.name} not found, skipping")
+            continue
+
+        w, h = Image.open(img_path).size
+        out_path = lab_dir / txt_path.name
+        with txt_path.open() as f_in, out_path.open("w") as f_out:
+            for line in f_in:
+                parts = line.strip().split()
+                if len(parts) < 8:                    # malformed row
+                    continue
+                # first 8 tokens are coordinates; the rest are class & difficulty
+                coords_px = list(map(float, parts[:8]))
+                coords_n  = [coords_px[i] / w if i % 2 == 0 else coords_px[i] / h
+                             for i in range(8)]
+                f_out.write("0 " + " ".join(f"{c:.6g}" for c in coords_n) + "\n")
+
+# ============================================================
+# 3 – Write data YAML
+# ============================================================
+yaml_path = root / "chimpface_obb.yaml"
+yaml_path.write_text(yaml.dump(dict(
+    path = str(root),
+    train= "train/images",
+    val  = "valid/images",
+    nc   = 1,
+    names= ["chimp_face"],
+)))
+print(f"✓ Wrote {yaml_path.relative_to(root)}")
+
+# ============================================================
+# 4 – Sanity-check & train with improved settings
+# ============================================================
+model = YOLO(MODEL_BASE)
+
+print("\nRunning quick sanity-check…")
+model.val(data=str(yaml_path), imgsz=640, batch=4, plots=False)    # should show ≥1 label per image
+
+print("\nStarting training with optimized settings ⏳")
+results = model.train(
+    data      = str(yaml_path),
+    epochs    = 160,
+    imgsz     = 640,
+    batch     = 16,
+    workers   = 8,
+    optimizer = "AdamW",    # Changed from SGD for faster convergence
+    lr0       = 0.001,      # Initial learning rate for AdamW
+    lrf       = 0.01,       # Final learning rate factor
+    patience  = 20,         # Early stopping patience
+    project   = "chimp_face_yolo8_obb",
+    name      = "exp2_optimized",
+    # Optimized augmentation settings for face detection
+    hsv_h     = 0.015,      # Hue variation
+    hsv_s     = 0.4,        # Saturation variation
+    hsv_v     = 0.4,        # Value (brightness) variation
+    degrees   = 15,         # Reduced rotation for faces
+    translate = 0.1,        # Translation
+    scale     = 0.5,        # Increased scale variance
+    shear     = 0.5,        # Reduced shear deformation
+    mosaic    = 1.0,        # Mosaic augmentation
+    fliplr    = 0.5,        # Horizontal flip
+    flipud    = 0.0,        # Disabled vertical flip
+    mixup     = 0.0,        # No mixup
+    save      = True,       # Save checkpoints
+    save_period = 10,       # Save every 10 epochs
+    plots     = True,       # Generate plots
+)
+
+print("\nFinal validation:")
+metrics = model.val(data=str(yaml_path), imgsz=640, batch=8)
+
+# ============================================================
+# 5 – Training Summary Function
+# ============================================================
+def generate_training_summary(model, results, metrics, yaml_path, save_dir="chimp_face_yolo8_obb/exp2_optimized"):
+    """
+    Generate a comprehensive summary of training progress and test metrics.
+    
+    Args:
+        model: Trained YOLO model
+        results: Training results object
+        metrics: Validation metrics
+        yaml_path: Path to data YAML file
+        save_dir: Directory where training results are saved
+    """
+    summary = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "model_base": MODEL_BASE,
+        "dataset": str(yaml_path),
+        "training_completed": True
+    }
+    
+    # Extract training metrics
+    if hasattr(results, 'results_dict'):
+        summary["final_epoch"] = len(results.results_dict.get('train/box_loss', []))
+        summary["best_epoch"] = results.best_epoch if hasattr(results, 'best_epoch') else None
+    
+    # Validation metrics
+    summary["validation_metrics"] = {
+        "mAP50": float(metrics.box.map50) if hasattr(metrics.box, 'map50') else None,
+        "mAP50-95": float(metrics.box.map) if hasattr(metrics.box, 'map') else None,
+        "precision": float(metrics.box.p[0]) if hasattr(metrics.box, 'p') else None,
+        "recall": float(metrics.box.r[0]) if hasattr(metrics.box, 'r') else None,
+    }
+    
+    # Test set evaluation if available
+    test_dir = root / "test" / "images"
+    if test_dir.exists():
+        print("\nEvaluating on test set...")
+        test_metrics = model.val(data=str(yaml_path), split='test', imgsz=640, batch=8)
+        summary["test_metrics"] = {
+            "mAP50": float(test_metrics.box.map50) if hasattr(test_metrics.box, 'map50') else None,
+            "mAP50-95": float(test_metrics.box.map) if hasattr(test_metrics.box, 'map') else None,
+            "precision": float(test_metrics.box.p[0]) if hasattr(test_metrics.box, 'p') else None,
+            "recall": float(test_metrics.box.r[0]) if hasattr(test_metrics.box, 'r') else None,
+        }
+    
+    # Load and analyze training history
+    results_path = Path(save_dir) / "results.csv"
+    if results_path.exists():
+        df = pd.read_csv(results_path)
+        df.columns = [col.strip() for col in df.columns]  # Clean column names
+        
+        # Find best metrics
+        if 'metrics/mAP50(B)' in df.columns:
+            best_map50_idx = df['metrics/mAP50(B)'].idxmax()
+            summary["best_validation"] = {
+                "epoch": int(best_map50_idx + 1),
+                "mAP50": float(df.loc[best_map50_idx, 'metrics/mAP50(B)']),
+                "mAP50-95": float(df.loc[best_map50_idx, 'metrics/mAP50-95(B)']) if 'metrics/mAP50-95(B)' in df.columns else None
+            }
+        
+        # Training progression
+        summary["training_progression"] = {
+            "initial_loss": float(df['train/box_loss'].iloc[0]) if 'train/box_loss' in df.columns else None,
+            "final_loss": float(df['train/box_loss'].iloc[-1]) if 'train/box_loss' in df.columns else None,
+            "loss_reduction": float((df['train/box_loss'].iloc[0] - df['train/box_loss'].iloc[-1]) / df['train/box_loss'].iloc[0] * 100) if 'train/box_loss' in df.columns else None
+        }
+        
+        # Generate plots
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # Loss curves
+        if 'train/box_loss' in df.columns:
+            axes[0, 0].plot(df.index + 1, df['train/box_loss'], label='Train Box Loss')
+            axes[0, 0].plot(df.index + 1, df['val/box_loss'], label='Val Box Loss')
+            axes[0, 0].set_xlabel('Epoch')
+            axes[0, 0].set_ylabel('Loss')
+            axes[0, 0].set_title('Box Loss Progression')
+            axes[0, 0].legend()
+            axes[0, 0].grid(True)
+        
+        # mAP curves
+        if 'metrics/mAP50(B)' in df.columns:
+            axes[0, 1].plot(df.index + 1, df['metrics/mAP50(B)'], label='mAP50', color='green')
+            axes[0, 1].plot(df.index + 1, df['metrics/mAP50-95(B)'], label='mAP50-95', color='blue')
+            axes[0, 1].set_xlabel('Epoch')
+            axes[0, 1].set_ylabel('mAP')
+            axes[0, 1].set_title('mAP Progression')
+            axes[0, 1].legend()
+            axes[0, 1].grid(True)
+        
+        # Precision/Recall
+        if 'metrics/precision(B)' in df.columns:
+            axes[1, 0].plot(df.index + 1, df['metrics/precision(B)'], label='Precision', color='red')
+            axes[1, 0].plot(df.index + 1, df['metrics/recall(B)'], label='Recall', color='orange')
+            axes[1, 0].set_xlabel('Epoch')
+            axes[1, 0].set_ylabel('Score')
+            axes[1, 0].set_title('Precision/Recall Progression')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True)
+        
+        # Learning rate
+        if 'lr/pg0' in df.columns:
+            axes[1, 1].plot(df.index + 1, df['lr/pg0'], label='Learning Rate', color='purple')
+            axes[1, 1].set_xlabel('Epoch')
+            axes[1, 1].set_ylabel('Learning Rate')
+            axes[1, 1].set_title('Learning Rate Schedule')
+            axes[1, 1].set_yscale('log')
+            axes[1, 1].grid(True)
+        
+        plt.tight_layout()
+        plot_path = Path(save_dir) / "training_summary_plots.png"
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        summary["plots_saved"] = str(plot_path)
+    
+    # Save summary as JSON
+    summary_path = Path(save_dir) / "training_summary.json"
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    # Print summary
+    print("\n" + "="*60)
+    print("TRAINING SUMMARY")
+    print("="*60)
+    print(f"Timestamp: {summary['timestamp']}")
+    print(f"Model: {summary['model_base']}")
+    print(f"Final Epoch: {summary.get('final_epoch', 'N/A')}")
+    print(f"Best Epoch: {summary.get('best_epoch', 'N/A')}")
+    
+    print("\nVALIDATION METRICS:")
+    for metric, value in summary['validation_metrics'].items():
+        if value is not None:
+            print(f"  {metric}: {value:.4f}")
+    
+    if 'test_metrics' in summary:
+        print("\nTEST METRICS:")
+        for metric, value in summary['test_metrics'].items():
+            if value is not None:
+                print(f"  {metric}: {value:.4f}")
+    
+    if 'best_validation' in summary:
+        print(f"\nBEST VALIDATION (Epoch {summary['best_validation']['epoch']}):")
+        print(f"  mAP50: {summary['best_validation']['mAP50']:.4f}")
+        if summary['best_validation']['mAP50-95']:
+            print(f"  mAP50-95: {summary['best_validation']['mAP50-95']:.4f}")
+    
+    if 'training_progression' in summary:
+        print(f"\nTRAINING PROGRESSION:")
+        print(f"  Initial Loss: {summary['training_progression']['initial_loss']:.4f}")
+        print(f"  Final Loss: {summary['training_progression']['final_loss']:.4f}")
+        print(f"  Loss Reduction: {summary['training_progression']['loss_reduction']:.1f}%")
+    
+    print(f"\nSummary saved to: {summary_path}")
+    if 'plots_saved' in summary:
+        print(f"Plots saved to: {summary['plots_saved']}")
+    print("="*60)
+    
+    return summary
+
+# Generate the training summary
+summary = generate_training_summary(model, results, metrics, yaml_path)
+
+# Save the best model
+best_model_path = Path("chimp_face_yolo8_obb/exp2_optimized/weights/best.pt")
+if best_model_path.exists():
+    print(f"\n✓ Best model saved at: {best_model_path}")
+else:
+    print("\n⚠️  Best model checkpoint not found!")
