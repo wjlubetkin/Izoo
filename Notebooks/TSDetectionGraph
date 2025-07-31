@@ -1,0 +1,342 @@
+# Chimp Face Detection + Recognition Pipeline with YOLOv8
+# Modified for video file processing with a weighted time-decay sliding window.
+
+from __future__ import annotations
+
+import cv2
+import numpy as np
+import tensorflow as tf
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+import warnings
+from collections import defaultdict, Counter, deque
+import pandas as pd
+warnings.filterwarnings('ignore')
+
+# Configure TensorFlow GPU settings
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(f"GPU configuration error: {e}")
+
+# ----------------------------- CONFIGURATION ---------------------------------
+# YOLOv8 Model Settings
+YOLO_MODEL_PATH = Path("best.pt")
+YOLO_CONF_THRESHOLD = 0.25
+YOLO_IMG_SIZE = 640
+
+# ConvNeXt Model Settings
+IMG_SIZE = (224, 224)
+CONVNEXT_MODEL_PATH = Path("convnext_finetuned_labelsmooth.keras")
+CLASS_NAMES_TXT = Path("convnext_finetuned_labelsmooth.classes.txt")
+
+# New Weighted Sliding Window Settings
+SLIDING_WINDOW_FRAMES = 300  # Window size W in frames (e.g., 5 seconds at 30fps)
+TIME_DECAY_RATE = 0.01      # Lambda (λ) for exponential decay: exp(-λ * frame_age)
+STATISTICS_TOP_K = 3        # Top K predictions to save in the CSV for each frame
+
+# Visualization Settings
+PLOT_BIN_SIZE = 10          # Average votes over this many frames for a cleaner plot
+
+# Manual color mapping (add custom colors here)
+IDENTITY_COLORS = {
+    'Cathy': 'green',
+    'Arthur': 'blue',
+    'Lucy'  : 'red',
+    'Sue'   : 'purple',
+    'Evelyne': 'orange',
+    'Unknown': 'grey',
+}
+# -----------------------------------------------------------------------------
+
+class ChimpFaceVideoPipeline:
+    def __init__(self):
+        # Initialize YOLOv8 model
+        print("Loading YOLOv8 model...")
+        self.yolo_model = YOLO(str(YOLO_MODEL_PATH))
+        
+        # Load ConvNeXt model with error handling
+        print("Loading ConvNeXt model...")
+        try:
+            self.convnext_model = tf.keras.models.load_model(CONVNEXT_MODEL_PATH, compile=False)
+        except Exception as e:
+            print(f"GPU loading failed: {e}")
+            print("Attempting to load model on CPU...")
+            with tf.device('/CPU:0'):
+                self.convnext_model = tf.keras.models.load_model(CONVNEXT_MODEL_PATH, compile=False)
+        
+        self.num_classes = self.convnext_model.output_shape[-1]
+        self.class_names = self._load_class_names()
+        
+        # Storage for frame-by-frame analysis results
+        self.frame_statistics = []
+
+    def _load_class_names(self) -> List[str]:
+        """Load class names from file or generate defaults."""
+        if CLASS_NAMES_TXT.exists():
+            names = [line.strip() for line in CLASS_NAMES_TXT.read_text().splitlines() if line.strip()]
+            if len(names) != self.num_classes:
+                raise ValueError(f"Class count mismatch: {len(names)} vs {self.num_classes}")
+            return names
+        return [f"chimp_{i}" for i in range(self.num_classes)]
+    
+    def detect_faces_yolo(self, image: np.ndarray) -> List[Dict]:
+        """Detect faces using YOLOv8 OBB model."""
+        results = self.yolo_model.predict(source=image, imgsz=YOLO_IMG_SIZE, conf=YOLO_CONF_THRESHOLD, verbose=False, stream=False)
+        detections = []
+        if results and len(results) > 0:
+            result = results[0]
+            if hasattr(result, 'obb') and result.obb is not None:
+                boxes, confs = result.obb.xyxy.cpu().numpy(), result.obb.conf.cpu().numpy()
+            elif hasattr(result, 'boxes') and result.boxes is not None:
+                boxes, confs = result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy()
+            else:
+                return []
+
+            for box, conf in zip(boxes, confs):
+                x1, y1, x2, y2 = map(int, box)
+                detections.append({'bbox': (x1, y1, x2 - x1, y2 - y1), 'confidence': float(conf)})
+        return detections
+    
+    def extract_face_crops(self, image: np.ndarray, detections: List[Dict]) -> List[np.ndarray]:
+        """Extract and resize face crops for model input."""
+        crops = []
+        for det in detections:
+            x, y, w, h = det['bbox']
+            padding = 0.1
+            pad_x, pad_y = int(w * padding), int(h * padding)
+            x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
+            x2, y2 = min(image.shape[1], x + w + pad_x), min(image.shape[0], y + h + pad_y)
+            crop = image[y1:y2, x1:x2]
+            if crop.size > 0:
+                crops.append(cv2.resize(crop, IMG_SIZE))
+        return crops
+
+    def recognize_faces(self, face_crops: List[np.ndarray]) -> Optional[np.ndarray]:
+        """Run ConvNeXt inference, returning the full prediction vector for the most confident detection."""
+        if not face_crops:
+            return None
+        
+        input_batch = np.array(face_crops, dtype=np.float32)
+        try:
+            predictions = self.convnext_model.predict(input_batch, verbose=0)
+        except Exception as e:
+            print(f"Inference error: {e}, retrying on CPU.")
+            with tf.device('/CPU:0'):
+                predictions = self.convnext_model.predict(input_batch, verbose=0)
+        
+        # For simplicity, we process the first detected face.
+        # This could be adapted to handle multiple tracked individuals.
+        return predictions[0]
+
+    def process_video(self, video_path: str):
+        """Process video with a weighted time-decay sliding window."""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"Video properties: FPS={fps}, Total Frames={total_frames}")
+        print(f"Using sliding window of {SLIDING_WINDOW_FRAMES} frames and decay rate of {TIME_DECAY_RATE}.")
+        
+        self.frame_statistics = []
+        # Use a deque for an efficient sliding window of recent predictions
+        recent_predictions = deque(maxlen=SLIDING_WINDOW_FRAMES)
+        all_time_weighted_votes = {name: [] for name in self.class_names}
+
+        for frame_count in range(total_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 1. Detect and Recognize
+            detections = self.detect_faces_yolo(frame)
+            face_crops = self.extract_face_crops(frame, detections)
+            # Get the full softmax output vector for the detected face
+            prediction_vector = self.recognize_faces(face_crops)
+            
+            # Add current frame's predictions to the sliding window
+            # If no face is detected, add a vector of zeros
+            if prediction_vector is not None:
+                recent_predictions.append(prediction_vector)
+            else:
+                recent_predictions.append(np.zeros(self.num_classes))
+
+            # 2. Calculate Weighted Votes within the window
+            weighted_votes = defaultdict(float)
+            # Iterate backwards from the most recent frame
+            for i, past_prediction_vector in enumerate(reversed(recent_predictions)):
+                frame_age = i
+                decay = np.exp(-TIME_DECAY_RATE * frame_age)
+                for class_idx, score in enumerate(past_prediction_vector):
+                    class_name = self.class_names[class_idx]
+                    weighted_votes[class_name] += score * decay
+
+            # 3. Store Statistics for this frame
+            for name in self.class_names:
+                all_time_weighted_votes[name].append(weighted_votes[name])
+
+            sorted_votes = sorted(weighted_votes.items(), key=lambda item: item[1], reverse=True)
+            top_k_votes = sorted_votes[:STATISTICS_TOP_K]
+            
+            frame_data = {'Frame': frame_count}
+            for i, (name, vote) in enumerate(top_k_votes):
+                frame_data[f'Top_{i+1}_Identity'] = name
+                frame_data[f'Top_{i+1}_Vote'] = vote
+            self.frame_statistics.append(frame_data)
+            
+            if frame_count % 100 == 0:
+                print(f"  Progress: {frame_count / total_frames * 100:.1f}% ({frame_count}/{total_frames})")
+
+        cap.release()
+        print("\nProcessing complete!")
+        return all_time_weighted_votes
+
+    def export_frame_statistics_to_csv(self, save_path: str = "frame_by_frame_statistics.csv"):
+        """Saves the collected frame statistics to a CSV file."""
+        if not self.frame_statistics:
+            print("No statistics were generated to save.")
+            return
+        
+        df = pd.DataFrame(self.frame_statistics)
+        # Fill missing columns for frames with fewer than K predictions
+        for i in range(STATISTICS_TOP_K):
+            if f'Top_{i+1}_Identity' not in df.columns:
+                df[f'Top_{i+1}_Identity'] = "N/A"
+                df[f'Top_{i+1}_Vote'] = 0.0
+        
+        df.to_csv(save_path, index=False)
+        print(f"Frame-by-frame statistics saved to: {save_path}")
+
+    def plot_weighted_vote_chromatogram(self, all_votes: Dict[str, List[float]], save_path: str = "vote_chromatogram.png"):
+        """
+        Creates a chromatogram-style plot of weighted votes over time,
+        with a "vote winner" timeline at the top.
+        """
+        if not all_votes:
+            print("No vote data available to plot.")
+            return
+
+        # Create two subplots: a small one on top for the winner timeline,
+        # and a large one below for the chromatogram.
+        fig, (ax_timeline, ax_main) = plt.subplots(
+            2, 1, figsize=(20, 10), sharex=True, 
+            gridspec_kw={'height_ratios': [1, 8], 'hspace': 0.05}
+        )
+        fig.suptitle('Weighted Identity Votes Over Time', fontsize=18, y=0.96)
+
+        def get_identity_color(name):
+            return IDENTITY_COLORS.get(name, plt.cm.tab20(abs(hash(name)) % 20 / 20.0))
+
+        num_frames = len(next(iter(all_votes.values())))
+        num_binned = (num_frames // PLOT_BIN_SIZE)
+        if num_binned == 0:
+             print("Not enough frames to create a binned plot. Try a smaller PLOT_BIN_SIZE.")
+             return
+        
+        binned_frames = np.linspace(0, num_frames, num_binned)
+        
+        # --- 1. Process data and plot the main chromatogram ---
+        vote_areas = {}
+        active_identities = []
+        binned_vote_data = []
+
+        for identity, votes in all_votes.items():
+            binned_votes = np.mean(np.array(votes[:num_binned * PLOT_BIN_SIZE]).reshape(-1, PLOT_BIN_SIZE), axis=1)
+            if np.sum(binned_votes) > 0:
+                active_identities.append(identity)
+                binned_vote_data.append(binned_votes)
+                vote_areas[identity] = np.sum(binned_votes)
+        
+        for i, identity in enumerate(active_identities):
+            color = get_identity_color(identity)
+            ax_main.plot(binned_frames, binned_vote_data[i], label=identity, color=color, linewidth=1.5)
+            ax_main.fill_between(binned_frames, binned_vote_data[i], alpha=0.3, color=color)
+
+        # --- 2. Determine and plot the winner timeline ---
+        if binned_vote_data:
+            votes_array = np.array(binned_vote_data)
+            # Find the index of the winner for each time bin
+            winner_indices = np.argmax(votes_array, axis=0)
+            
+            # Use axvspan to draw colored blocks for each winner's streak
+            current_winner_idx = -1
+            start_frame_idx = 0
+            for i, winner_idx in enumerate(winner_indices):
+                if winner_idx != current_winner_idx:
+                    if current_winner_idx != -1:
+                        # End of the previous winner's block
+                        winner_name = active_identities[current_winner_idx]
+                        color = get_identity_color(winner_name)
+                        ax_timeline.axvspan(binned_frames[start_frame_idx], binned_frames[i], color=color, alpha=0.9, lw=0)
+                    # Start of a new winner's block
+                    current_winner_idx = winner_idx
+                    start_frame_idx = i
+            
+            # Draw the final block for the last winner
+            if current_winner_idx != -1:
+                winner_name = active_identities[current_winner_idx]
+                color = get_identity_color(winner_name)
+                # Ensure the span covers the entire last bin
+                end_frame = binned_frames[-1] + (binned_frames[1] - binned_frames[0] if len(binned_frames) > 1 else PLOT_BIN_SIZE)
+                ax_timeline.axvspan(binned_frames[start_frame_idx], end_frame, color=color, alpha=0.9, lw=0)
+
+        # --- 3. Finalize plot aesthetics ---
+        # Configure timeline axis
+        ax_timeline.set_yticks([])
+        ax_timeline.set_ylabel('Winner', rotation=0, ha='right', va='center')
+        ax_timeline.margins(x=0)
+
+        # Configure main chromatogram axis
+        handles, labels = ax_main.get_legend_handles_labels()
+        sorted_labels_handles = sorted(zip(labels, handles), key=lambda x: vote_areas.get(x[0], 0), reverse=True)
+        sorted_handles = [h for l, h in sorted_labels_handles]
+        sorted_labels = [l for l, h in sorted_labels_handles]
+
+        ax_main.legend(sorted_handles, sorted_labels, title="Identity", bbox_to_anchor=(1.02, 1), loc='upper left')
+        ax_main.set_xlabel('Frame Number', fontsize=12)
+        ax_main.set_ylabel('Time-Decayed Weighted Vote', fontsize=12)
+        ax_main.grid(True, which='both', linestyle='--', linewidth=0.5)
+        ax_main.set_xlim(0, num_frames)
+        ax_main.set_ylim(bottom=0)
+        
+        plt.tight_layout(rect=[0, 0, 0.9, 0.95]) # Adjust layout for suptitle and legend
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300)
+            print(f"Chromatogram plot saved to: {save_path}")
+        
+        plt.show()
+
+
+# Example usage
+def analyze_video(video_path: str):
+    """
+    Main function to run the analysis pipeline.
+    """
+    pipeline = ChimpFaceVideoPipeline()
+    
+    # Process video to get weighted votes
+    all_time_votes = pipeline.process_video(video_path)
+    
+    # Export detailed frame-by-frame statistics to CSV
+    pipeline.export_frame_statistics_to_csv()
+    
+    # Generate and save the chromatogram plot
+    pipeline.plot_weighted_vote_chromatogram(all_time_votes)
+    
+    return pipeline
+
+# To run from a script or Jupyter notebook:
+# if __name__ == '__main__':
+#     video_file = "path/to/your/video.mp4"
+#     if not Path(video_file).exists():
+#         print(f"Video file not found: {video_file}")
+#     else:
+#         analysis_pipeline = analyze_video(video_file)
