@@ -1,0 +1,175 @@
+from pathlib import Path
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+BEST_CHECKPT  = Path("best.pt")   # adjust if you renamed exp
+INFER_FOLDER  = "test"    # <— change to the folder you want to batch-predict
+OUTPUT_FOLDER = "cropped_faces"   # <— new folder for cropped face images
+
+# Face selection method: "confidence" or "area"
+SELECTION_METHOD = "confidence"  # Change to "area" to select largest face instead
+
+# Create output directory
+output_path = Path(OUTPUT_FOLDER)
+output_path.mkdir(parents=True, exist_ok=True)
+
+# Load the trained model
+model = YOLO(str(BEST_CHECKPT))
+print(f"✓ Loaded model from {BEST_CHECKPT}")
+print(f"✓ Face selection method: {SELECTION_METHOD}")
+
+# -- 1. Function to crop faces from oriented bounding boxes
+def crop_face_from_obb(image, obb_coords, padding=0.1):
+    """
+    Crop face from image using oriented bounding box coordinates
+    
+    Args:
+        image: OpenCV image (numpy array)
+        obb_coords: OBB coordinates [x1, y1, x2, y2, x3, y3, x4, y4] (8 values)
+        padding: Additional padding around the face (as fraction of bbox size)
+    
+    Returns:
+        cropped_face: Cropped face image
+    """
+    # Reshape OBB coordinates to 4 points
+    points = np.array(obb_coords).reshape(4, 2)
+    
+    # Get the bounding rectangle of the oriented box
+    rect = cv2.boundingRect(points.astype(np.float32))
+    x, y, w, h = rect
+    
+    # Add padding
+    pad_w = int(w * padding)
+    pad_h = int(h * padding)
+    
+    # Calculate crop coordinates with padding
+    x1 = max(0, x - pad_w)
+    y1 = max(0, y - pad_h)
+    x2 = min(image.shape[1], x + w + pad_w)
+    y2 = min(image.shape[0], y + h + pad_h)
+    
+    # Crop the face
+    cropped_face = image[y1:y2, x1:x2]
+    
+    return cropped_face
+
+def calculate_obb_area(obb_coords):
+    """
+    Calculate the area of an oriented bounding box
+    
+    Args:
+        obb_coords: OBB coordinates [x1, y1, x2, y2, x3, y3, x4, y4]
+    
+    Returns:
+        area: Area of the OBB
+    """
+    points = np.array(obb_coords).reshape(4, 2)
+    # Use Shoelace formula to calculate polygon area
+    x = points[:, 0]
+    y = points[:, 1]
+    area = 0.5 * abs(sum(x[i] * y[i+1] - x[i+1] * y[i] for i in range(-1, len(x)-1)))
+    return area
+
+# -- 2. Run inference and crop faces
+print(f"\n▶ Detecting and cropping faces from {INFER_FOLDER} …")
+
+# Get all image files in the input folder
+input_path = Path(INFER_FOLDER)
+image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
+image_files = []
+for ext in image_extensions:
+    image_files.extend(input_path.glob(f'*{ext}'))
+    image_files.extend(input_path.glob(f'*{ext.upper()}'))
+
+face_count = 0
+processed_images = 0
+
+for img_file in image_files:
+    # Load image
+    image = cv2.imread(str(img_file))
+    if image is None:
+        print(f"⚠ Could not load image: {img_file}")
+        continue
+    
+    # Run prediction on single image
+    results = model.predict(
+        source=str(img_file),
+        imgsz=640,
+        conf=0.25,
+        verbose=False
+    )
+    
+    processed_images += 1
+    
+    # Process detections and collect all faces
+    faces_data = []  # List to store (obb_coords, confidence, area) for each face
+    
+    for i, result in enumerate(results):
+        if result.obb is not None and len(result.obb) > 0:
+            # Get OBB coordinates and confidences
+            for j, (obb, conf) in enumerate(zip(result.obb.xyxyxyxy, result.obb.conf)):
+                # Convert tensor to numpy if needed
+                if hasattr(obb, 'cpu'):
+                    obb_coords = obb.cpu().numpy()
+                    confidence = conf.cpu().numpy().item()
+                else:
+                    obb_coords = obb
+                    confidence = conf.item() if hasattr(conf, 'item') else conf
+                
+                # Calculate area
+                area = calculate_obb_area(obb_coords)
+                
+                faces_data.append((obb_coords, confidence, area))
+    
+    # Select the best face based on chosen method
+    if faces_data:
+        if SELECTION_METHOD == "confidence":
+            # Select face with highest confidence
+            best_face = max(faces_data, key=lambda x: x[1])
+            selection_value = best_face[1]
+            selection_type = "confidence"
+        else:  # area
+            # Select face with largest area
+            best_face = max(faces_data, key=lambda x: x[2])
+            selection_value = best_face[2]
+            selection_type = "area"
+        
+        obb_coords, confidence, area = best_face
+        
+        # Crop the selected face
+        try:
+            cropped_face = crop_face_from_obb(image, obb_coords, padding=0.1)
+            
+            if cropped_face.size > 0:  # Check if crop is valid
+                # Create output filename
+                base_name = img_file.stem
+                output_filename = f"{base_name}_face.jpg"
+                output_filepath = output_path / output_filename
+                
+                # Save cropped face
+                cv2.imwrite(str(output_filepath), cropped_face)
+                face_count += 1
+                
+                print(f"✓ Saved face from {img_file.name} (selected by {selection_type}: {selection_value:.3f})")
+            
+        except Exception as e:
+            print(f"⚠ Error cropping face from {img_file}: {e}")
+    else:
+        print(f"⚠ No faces detected in {img_file.name}")
+
+print(f"\n✓ Processing complete!")
+print(f"📊 Processed {processed_images} images")
+print(f"👤 Extracted {face_count} faces (1 per image, selected by {SELECTION_METHOD})")
+print(f"📁 Cropped faces saved to: {output_path}")
+
+# -- 3. Optional: Display sample cropped faces (Jupyter only)
+try:
+    from IPython.display import Image as IPyImage, display
+    print(f"\n▶ Displaying first 5 cropped faces:")
+    cropped_files = list(output_path.glob("*.jpg"))[:5]
+    for face_file in cropped_files:
+        print(f"Face: {face_file.name}")
+        display(IPyImage(filename=str(face_file)))
+except ImportError:
+    print("\n(IPython not available - skipping display of cropped faces)")
