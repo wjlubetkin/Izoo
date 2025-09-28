@@ -1,29 +1,44 @@
+import math
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
 import keras_cv
-from pathlib import Path
 
 """
-ConvNeXt fine‑tuning pipeline **with label smoothing**
------------------------------------------------------
-• Uses ConvNeXt backbone with built‑in Normalization (expects [0‑255] float inputs).
-• Applies heavier label smoothing for initial training, lighter during fine‑tune.
-• **NEW:** Automatically writes `class_names.txt` next to the saved model so the
-  inference script can pick it up without manual bookkeeping (one class name
-  per line, matching the training order).
+ConvNeXt fine-tuning pipeline with label smoothing & optional K-fold validation.
+-------------------------------------------------------------------------------
+• Uses ConvNeXt backbone with built-in Normalization (expects [0-255] float inputs).
+• Applies heavier label smoothing for initial training, lighter during fine-tune.
+• Automatically writes `class_names.txt` next to the saved model so inference can
+  consume the labels without manual bookkeeping.
+• NEW: Supports reproducible K-fold cross validation with configurable train / val /
+  test fractions.
 
-Tested with TF‑Keras ≥ 2.19.
+Tested with TF-Keras >= 2.19.
 """
 
 # ---------------------------- CONFIGURATION ----------------------------------
-DATA_ROOT = Path("./IndyZooFaces")       # folder with sub‑dirs per class
-VAL_SPLIT = 0.15                       # validation fraction
+DATA_ROOT = Path("./IndyZooFaces")       # folder with sub-dirs per class
+VAL_SPLIT = 0.15                       # validation fraction (used when K-fold disabled)
 IMG_SIZE   = (224, 224)
 BATCH_SIZE = 32
 
-LABEL_SMOOTH_INIT = 0.10               # heavier for warm‑up
-LABEL_SMOOTH_FINE = 0.05               # lighter for fine‑tune
+# K-fold configuration ----------------------------------------------------
+USE_K_FOLD = False
+K_FOLDS = 5
+# Fractions should sum to 1.0.
+SPLIT_FRACTIONS = {
+    "train": 0.70,
+    "val": 0.15,
+    "test": 0.15,
+}
+
+LABEL_SMOOTH_INIT = 0.10               # heavier for warm-up
+LABEL_SMOOTH_FINE = 0.05               # lighter for fine-tune
 
 EPOCHS_INIT = 10
 EPOCHS_FINE = 10
@@ -33,102 +48,360 @@ CLASS_NAMES_TXT = MODEL_OUT.with_suffix(".classes.txt")
 
 AUTOTUNE = tf.data.AUTOTUNE
 RAND_AUG = keras_cv.layers.RandAugment(value_range=(0, 255))
+SEED = 1337
+ALLOWED_IMAGE_EXTS = {".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 # -----------------------------------------------------------------------------
 
-# Dataset -----------------------------------------------------------------
 
-def build_dataset(root: Path, validation_split: float = 0.0, subset: str | None = None):
-    """Return (dataset, class_names)."""
+def _ensure_split_config() -> None:
+    total = sum(SPLIT_FRACTIONS.values())
+    if not math.isclose(total, 1.0, abs_tol=1e-6):
+        raise ValueError(
+            f"SPLIT_FRACTIONS must sum to 1.0, received total={total:.4f}."
+        )
+
+    train_fraction = SPLIT_FRACTIONS.get("train", 0.0)
+    val_fraction = SPLIT_FRACTIONS.get("val", 0.0)
+    test_fraction = SPLIT_FRACTIONS.get("test", 0.0)
+
+    if train_fraction <= 0:
+        raise ValueError("Train fraction must be greater than 0.")
+    if val_fraction <= 0:
+        raise ValueError("Validation fraction must be greater than 0.")
+
+    if USE_K_FOLD:
+        if K_FOLDS < 2:
+            raise ValueError("K_FOLDS must be ≥ 2 when USE_K_FOLD is enabled.")
+        if test_fraction <= 0:
+            raise ValueError("Test fraction must be greater than 0 for K-fold training.")
+        expected_test = 1.0 / K_FOLDS
+        if not math.isclose(test_fraction, expected_test, rel_tol=0.05, abs_tol=1e-3):
+            raise ValueError(
+                "Test fraction must approximately equal 1 / K_FOLDS when "
+                f"using K-fold cross validation (expected ≈ {expected_test:.4f}, "
+                f"got {test_fraction:.4f})."
+            )
+
+
+def _save_class_names(class_names: Iterable[str]) -> None:
+    CLASS_NAMES_TXT.write_text("\n".join(class_names) + "\n", encoding="utf-8")
+    print(f"Saved class names → {CLASS_NAMES_TXT.resolve()}")
+
+
+def _apply_randaugment(ds: tf.data.Dataset) -> tf.data.Dataset:
+    return ds.map(
+        lambda x, y: (
+            tf.cast(RAND_AUG(tf.cast(x, tf.uint8), training=True), tf.float32),
+            y,
+        ),
+        num_parallel_calls=AUTOTUNE,
+    ).prefetch(AUTOTUNE)
+
+
+def _build_model(num_classes: int) -> tuple[keras.Model, keras.Model]:
+    backbone = keras.applications.ConvNeXtBase(
+        include_top=False,
+        weights="imagenet",
+        include_preprocessing=True,
+        input_shape=IMG_SIZE + (3,),
+        pooling="avg",
+    )
+    backbone.trainable = False
+
+    x = layers.Dropout(0.2)(backbone.output)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+    model = keras.Model(backbone.input, outputs, name="convnext_finetune")
+    return model, backbone
+
+
+def _train_with_finetune(
+    train_ds: tf.data.Dataset, val_ds: tf.data.Dataset, num_classes: int
+) -> keras.Model:
+    model, backbone = _build_model(num_classes)
+
+    # Initial warm-up training
+    loss_init = keras.losses.CategoricalCrossentropy(
+        label_smoothing=LABEL_SMOOTH_INIT
+    )
+    model.compile(
+        optimizer=keras.optimizers.AdamW(
+            learning_rate=1e-4,
+            weight_decay=0.05,
+            beta_1=0.9,
+            beta_2=0.999,
+        ),
+        loss=loss_init,
+        metrics=["accuracy"],
+    )
+    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_INIT)
+
+    # Fine-tuning with lower learning rate
+    backbone.trainable = True
+    loss_fine = keras.losses.CategoricalCrossentropy(
+        label_smoothing=LABEL_SMOOTH_FINE
+    )
+    model.compile(
+        optimizer=keras.optimizers.AdamW(
+            learning_rate=1e-5,
+            weight_decay=0.05,
+            beta_1=0.9,
+            beta_2=0.999,
+        ),
+        loss=loss_fine,
+        metrics=["accuracy"],
+    )
+    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FINE)
+
+    return model
+
+
+def _directory_dataset(
+    root: Path, validation_split: float = 0.0, subset: str | None = None
+) -> tuple[tf.data.Dataset, tuple[str, ...]]:
     ds = tf.keras.utils.image_dataset_from_directory(
         root,
         labels="inferred",
-        label_mode="int",               # integers → we will one‑hot
+        label_mode="int",
         validation_split=validation_split if subset else None,
         subset=subset,
-        seed=1337,
+        seed=SEED,
         image_size=IMG_SIZE,
         batch_size=BATCH_SIZE,
         interpolation="bicubic",
         shuffle=True,
     )
 
-    class_names = tuple(ds.class_names)  # immutable copy
+    class_names = tuple(ds.class_names)
     num_classes = len(class_names)
 
-    # Cast to float32 (keep 0‑255 range) and one‑hot encode labels for CCE.
     ds = ds.map(
         lambda x, y: (tf.cast(x, tf.float32), tf.one_hot(y, num_classes)),
         num_parallel_calls=AUTOTUNE,
     )
     return ds.cache().prefetch(AUTOTUNE), class_names
 
-train_ds, CLASS_NAMES = build_dataset(DATA_ROOT, VAL_SPLIT, "training")
-val_ds, _             = build_dataset(DATA_ROOT, VAL_SPLIT, "validation")
-NUM_CLASSES = len(CLASS_NAMES)
 
-# Apply RandAugment only on the training dataset
-train_ds = train_ds.map(
+def _build_standard_datasets() -> tuple[
+    tf.data.Dataset, tf.data.Dataset, tuple[str, ...]
+]:
+    train_ds, class_names = _directory_dataset(DATA_ROOT, VAL_SPLIT, "training")
+    val_ds, _ = _directory_dataset(DATA_ROOT, VAL_SPLIT, "validation")
+    train_ds = _apply_randaugment(train_ds)
+    return train_ds, val_ds, class_names
 
-    lambda x, y: (
-        tf.cast(
-            RAND_AUG(tf.cast(x, tf.uint8), training=True),
-            tf.float32,
-        ),
-        y,
-    ),
 
-    num_parallel_calls=AUTOTUNE,
-).prefetch(AUTOTUNE)
+def _make_preprocess_fn(num_classes: int):
+    def _preprocess(path: tf.Tensor, label: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        image = tf.io.read_file(path)
+        image = tf.io.decode_image(image, channels=3, expand_animations=False)
+        image = tf.image.resize(image, IMG_SIZE, method="bicubic")
+        image = tf.cast(image, tf.float32)
+        image.set_shape(IMG_SIZE + (3,))
+        return image, tf.one_hot(tf.cast(label, tf.int32), num_classes)
 
-# Persist class names ------------------------------------------------------
-CLASS_NAMES_TXT.write_text("\n".join(CLASS_NAMES) + "\n", encoding="utf‑8")
-print(f"Saved class names → {CLASS_NAMES_TXT.resolve()}")
+    return _preprocess
 
-# Model -------------------------------------------------------------------
-backbone = keras.applications.ConvNeXtBase(
-    include_top=False,
-    weights="imagenet",
-    include_preprocessing=True,   # built‑in Normalization layer
-    input_shape=IMG_SIZE + (3,),
-    pooling="avg",               # global average pool
-)
 
-x = layers.Dropout(0.2)(backbone.output)
-outputs = layers.Dense(NUM_CLASSES, activation="softmax")(x)
-model = keras.Model(backbone.input, outputs, name="convnext_finetune")
+def _build_dataset_from_paths(
+    all_paths: np.ndarray,
+    all_labels: np.ndarray,
+    indices: np.ndarray,
+    num_classes: int,
+    *,
+    shuffle: bool,
+) -> tf.data.Dataset:
+    subset_paths = all_paths[indices]
+    subset_labels = all_labels[indices]
 
-# Compile & initial training ---------------------------------------------
-loss_init = keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTH_INIT)
-model.compile(
-optimizer = keras.optimizers.AdamW(
-    learning_rate=1e-4,
-    weight_decay=0.05,          
-    beta_1=0.9,
-    beta_2=0.999,
-),
-    loss=loss_init,
-    metrics=["accuracy"],
-)
+    ds = tf.data.Dataset.from_tensor_slices((subset_paths, subset_labels))
+    if shuffle:
+        ds = ds.shuffle(
+            buffer_size=len(subset_paths),
+            seed=SEED,
+            reshuffle_each_iteration=True,
+        )
+    ds = ds.map(_make_preprocess_fn(num_classes), num_parallel_calls=AUTOTUNE)
+    return ds.cache().batch(BATCH_SIZE).prefetch(AUTOTUNE)
 
-model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_INIT)
 
-# Fine‑tuning -------------------------------------------------------------
-backbone.trainable = True  # unfreeze
-loss_fine = keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTH_FINE)
-model.compile(
-optimizer = keras.optimizers.AdamW(
-    learning_rate=1e-5,
-    weight_decay=0.05,          # We want to try 0.02–0.05 grid-search eventually
-    beta_1=0.9,
-    beta_2=0.999,
-),   # lower LR for fine‑tune
-    loss=loss_fine,
-    metrics=["accuracy"],
-)
+def _gather_image_paths(root: Path) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+    class_dirs = sorted([p for p in root.iterdir() if p.is_dir()])
+    if not class_dirs:
+        raise ValueError(f"No class sub-directories found in {root!s}.")
 
-model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FINE)
+    image_paths: list[str] = []
+    labels: list[int] = []
+    for class_idx, class_dir in enumerate(class_dirs):
+        files = sorted(
+            file
+            for file in class_dir.rglob("*")
+            if file.is_file() and file.suffix.lower() in ALLOWED_IMAGE_EXTS
+        )
+        if USE_K_FOLD and len(files) < K_FOLDS:
+            raise ValueError(
+                f"Class '{class_dir.name}' has {len(files)} samples, which is "
+                f"insufficient for {K_FOLDS}-fold cross validation."
+            )
+        for file in files:
+            image_paths.append(str(file))
+            labels.append(class_idx)
 
-# Save --------------------------------------------------------------------
-model.save(MODEL_OUT)
-print(f"Model saved → {MODEL_OUT.resolve()}")
-print("Training complete!")
+    if not image_paths:
+        raise ValueError(f"No image files found under {root!s}.")
+
+    return (
+        np.array(image_paths, dtype=object),
+        np.array(labels, dtype=np.int32),
+        tuple(path.name for path in class_dirs),
+    )
+
+
+def _stratified_kfold_indices(
+    labels: np.ndarray, k: int, *, seed: int
+) -> Iterable[tuple[int, np.ndarray, np.ndarray]]:
+    labels = np.asarray(labels)
+    rng = np.random.default_rng(seed)
+    fold_to_indices: list[list[int]] = [[] for _ in range(k)]
+
+    for class_label in np.unique(labels):
+        class_indices = np.where(labels == class_label)[0]
+        rng.shuffle(class_indices)
+        splits = np.array_split(class_indices, k)
+        for fold_idx, split in enumerate(splits):
+            fold_to_indices[fold_idx].extend(split.tolist())
+
+    all_indices = np.arange(len(labels))
+    for fold_idx in range(k):
+        test_idx = np.array(sorted(fold_to_indices[fold_idx]), dtype=np.int32)
+        train_val_idx = np.array(
+            sorted(np.setdiff1d(all_indices, test_idx, assume_unique=True)),
+            dtype=np.int32,
+        )
+        yield fold_idx, train_val_idx, test_idx
+
+
+def _split_train_val_indices(
+    train_val_idx: np.ndarray,
+    *,
+    train_fraction: float,
+    val_fraction: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    rng.shuffle(train_val_idx)
+    remainder = train_fraction + val_fraction
+    if remainder <= 0:
+        raise ValueError("Train and validation fractions must sum to > 0.")
+
+    val_ratio = val_fraction / remainder
+    val_size = max(1, int(round(len(train_val_idx) * val_ratio)))
+    if val_size >= len(train_val_idx):
+        val_size = len(train_val_idx) - 1
+
+    if val_size <= 0 or len(train_val_idx) - val_size <= 0:
+        raise ValueError(
+            "Not enough samples to satisfy train/validation split inside the fold."
+        )
+
+    val_indices = train_val_idx[:val_size]
+    train_indices = train_val_idx[val_size:]
+    return train_indices, val_indices
+
+
+def _run_single_training() -> None:
+    train_ds, val_ds, class_names = _build_standard_datasets()
+    num_classes = len(class_names)
+    _save_class_names(class_names)
+
+    model = _train_with_finetune(train_ds, val_ds, num_classes)
+    model.save(MODEL_OUT)
+    print(f"Model saved → {MODEL_OUT.resolve()}")
+    print("Training complete!")
+
+
+def _run_kfold_training() -> None:
+    all_paths, all_labels, class_names = _gather_image_paths(DATA_ROOT)
+    num_classes = len(class_names)
+    _save_class_names(class_names)
+
+    rng = np.random.default_rng(SEED)
+    train_fraction = SPLIT_FRACTIONS["train"]
+    val_fraction = SPLIT_FRACTIONS["val"]
+
+    best_accuracy = -math.inf
+    best_fold: int | None = None
+    fold_accuracies: list[float] = []
+
+    for fold_idx, train_val_idx, test_idx in _stratified_kfold_indices(
+        all_labels, K_FOLDS, seed=SEED
+    ):
+        train_val_idx = np.array(train_val_idx, copy=True)
+        if len(train_val_idx) < 2:
+            raise ValueError(
+                "Not enough samples remain for train/validation split inside the fold."
+            )
+
+        train_idx, val_idx = _split_train_val_indices(
+            train_val_idx,
+            train_fraction=train_fraction,
+            val_fraction=val_fraction,
+            rng=rng,
+        )
+
+        print(
+            f"\n--- Fold {fold_idx + 1}/{K_FOLDS} ---\n"
+            f"Train samples: {len(train_idx)}, Val samples: {len(val_idx)}, "
+            f"Test samples: {len(test_idx)}"
+        )
+
+        train_ds = _build_dataset_from_paths(
+            all_paths, all_labels, train_idx, num_classes, shuffle=True
+        )
+        val_ds = _build_dataset_from_paths(
+            all_paths, all_labels, val_idx, num_classes, shuffle=False
+        )
+        test_ds = _build_dataset_from_paths(
+            all_paths, all_labels, test_idx, num_classes, shuffle=False
+        )
+
+        train_ds = _apply_randaugment(train_ds)
+
+        model = _train_with_finetune(train_ds, val_ds, num_classes)
+
+        test_results = model.evaluate(test_ds, verbose=0)
+        metric_names = model.metrics_names
+        metrics_dict = dict(zip(metric_names, test_results))
+        accuracy = float(metrics_dict.get("accuracy", float("nan")))
+        print(f"Fold {fold_idx + 1} test metrics: {metrics_dict}")
+        fold_accuracies.append(accuracy)
+
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_fold = fold_idx + 1
+            model.save(MODEL_OUT)
+            print(
+                f"Best model (so far) saved from fold {best_fold} → {MODEL_OUT.resolve()}"
+            )
+
+    if fold_accuracies:
+        mean_acc = float(np.nanmean(fold_accuracies))
+        std_acc = float(np.nanstd(fold_accuracies))
+        print(
+            f"\nK-fold accuracy summary: mean={mean_acc:.4f}, std={std_acc:.4f}"
+        )
+        if best_fold is not None:
+            print(
+                f"Best fold: {best_fold} with accuracy {best_accuracy:.4f} (saved model)."
+            )
+    print("Cross-validation complete!")
+
+
+def main() -> None:
+    _ensure_split_config()
+    if USE_K_FOLD:
+        _run_kfold_training()
+    else:
+        _run_single_training()
+
+
+if __name__ == "__main__":
+    main()
