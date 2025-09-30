@@ -1,0 +1,340 @@
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import keras_cv
+from pathlib import Path
+import numpy as np
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.preprocessing import LabelEncoder
+import os
+import random
+import json
+from datetime import datetime
+
+"""
+ConvNeXt fine‑tuning pipeline **with label smoothing and K-Fold CV**
+--------------------------------------------------------------------
+• Uses ConvNeXt backbone with built‑in Normalization (expects [0‑255] float inputs).
+• Applies heavier label smoothing for initial training, lighter during fine‑tune.
+• **NEW:** 70/20/10 train/val/test split with K-fold cross-validation
+• **NEW:** Automatically writes `class_names.txt` next to the saved model so the
+  inference script can pick it up without manual bookkeeping (one class name
+  per line, matching the training order).
+
+Tested with TF‑Keras ≥ 2.19.
+"""
+
+# ---------------------------- CONFIGURATION ----------------------------------
+DATA_ROOT = Path("./IndyZooFaces")       # folder with sub‑dirs per class
+TRAIN_SPLIT = 0.75                     # 70% for training
+VAL_SPLIT = 0.15                      # 20% for validation  
+TEST_SPLIT = None                      # 10% for test
+K_FOLDS = 5                            # number of folds for cross-validation
+
+IMG_SIZE   = (224, 224)
+BATCH_SIZE = 32
+
+LABEL_SMOOTH_INIT = 0.10               # heavier for warm‑up
+LABEL_SMOOTH_FINE = 0.05               # lighter for fine‑tune
+
+EPOCHS_INIT = 10
+EPOCHS_FINE = 10
+
+MODEL_OUT      = Path("convnext_finetuned_labelsmooth_kfold.keras")
+CLASS_NAMES_TXT = MODEL_OUT.with_suffix(".classes.txt")
+SPLITS_LOG = MODEL_OUT.with_suffix(".splits.json")
+
+AUTOTUNE = tf.data.AUTOTUNE
+RAND_AUG = keras_cv.layers.RandAugment(value_range=(0, 255))
+# -----------------------------------------------------------------------------
+
+def save_split_info(split_data, filepath):
+    """Save detailed split information to JSON file."""
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(split_data, f, indent=2, ensure_ascii=False)
+    print(f"Split information saved → {filepath.resolve()}")
+
+def organize_splits_by_class(paths, labels, class_names):
+    """Organize file paths by class for readable split logging."""
+    splits_by_class = {class_name: [] for class_name in class_names}
+    for path, label in zip(paths, labels):
+        splits_by_class[label].append(Path(path).name)  # Store just filename for readability
+    return splits_by_class
+
+def get_file_paths_and_labels(data_root: Path):
+    """Extract all file paths and corresponding labels from directory structure."""
+    file_paths = []
+    labels = []
+    class_names = []
+    
+    # Get all class directories
+    class_dirs = [d for d in data_root.iterdir() if d.is_dir()]
+    class_dirs.sort()  # Ensure consistent ordering
+    
+    for class_dir in class_dirs:
+        class_name = class_dir.name
+        class_names.append(class_name)
+        
+        # Get all image files in this class directory
+        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.gif']:
+            for img_path in class_dir.glob(ext):
+                file_paths.append(str(img_path))
+                labels.append(class_name)
+    
+    return file_paths, labels, class_names
+
+def create_dataset_from_paths(file_paths, labels, class_names, is_training=False):
+    """Create a tf.data.Dataset from file paths and labels."""
+    # Convert labels to integers
+    label_encoder = LabelEncoder()
+    label_encoder.fit(class_names)
+    int_labels = label_encoder.transform(labels)
+    
+    # Create dataset from file paths
+    def load_and_preprocess_image(path, label):
+        image = tf.io.read_file(path)
+        image = tf.image.decode_image(image, channels=3)
+        image.set_shape([None, None, 3])  # Set shape before resize
+        image = tf.image.resize(image, IMG_SIZE, method='bicubic')
+        image = tf.cast(image, tf.float32)
+        
+        # One-hot encode labels
+        label_onehot = tf.one_hot(label, len(class_names))
+        return image, label_onehot
+    
+    dataset = tf.data.Dataset.from_tensor_slices((file_paths, int_labels))
+    dataset = dataset.map(load_and_preprocess_image, num_parallel_calls=AUTOTUNE)
+    
+    if is_training:
+        # Use a different random seed for each dataset shuffle
+        shuffle_seed = random.randint(1, 100000)
+        dataset = dataset.shuffle(buffer_size=1000, seed=shuffle_seed)
+        # Apply RandAugment for training
+        dataset = dataset.map(
+            lambda x, y: (
+                tf.cast(
+                    RAND_AUG(tf.cast(x, tf.uint8), training=True),
+                    tf.float32,
+                ),
+                y,
+            ),
+            num_parallel_calls=AUTOTUNE,
+        )
+    
+    dataset = dataset.batch(BATCH_SIZE)
+    dataset = dataset.cache().prefetch(AUTOTUNE)
+    
+    return dataset
+
+def create_model(num_classes):
+    """Create and compile the ConvNeXt model."""
+    backbone = keras.applications.ConvNeXtBase(
+        include_top=False,
+        weights="imagenet",
+        include_preprocessing=True,   # built‑in Normalization layer
+        input_shape=IMG_SIZE + (3,),
+        pooling="avg",               # global average pool
+    )
+    
+    x = layers.Dropout(0.2)(backbone.output)
+    outputs = layers.Dense(num_classes, activation="softmax")(x)
+    model = keras.Model(backbone.input, outputs, name="convnext_finetune")
+    
+    return model, backbone
+
+def train_model_fold(train_paths, train_labels, val_paths, val_labels, class_names, fold_num):
+    """Train model for a single fold."""
+    print(f"\n=== Training Fold {fold_num + 1}/{K_FOLDS} ===")
+    
+    # Create datasets
+    train_ds = create_dataset_from_paths(train_paths, train_labels, class_names, is_training=True)
+    val_ds = create_dataset_from_paths(val_paths, val_labels, class_names, is_training=False)
+    
+    # Create model
+    model, backbone = create_model(len(class_names))
+    
+    # Initial training (frozen backbone)
+    print("Phase 1: Training with frozen backbone...")
+    backbone.trainable = False
+    loss_init = keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTH_INIT)
+    model.compile(
+        optimizer=keras.optimizers.AdamW(
+            learning_rate=1e-4,
+            weight_decay=0.05,
+            beta_1=0.9,
+            beta_2=0.999,
+        ),
+        loss=loss_init,
+        metrics=["accuracy"],
+    )
+    
+    history_init = model.fit(
+        train_ds, 
+        validation_data=val_ds, 
+        epochs=EPOCHS_INIT,
+        verbose=1
+    )
+    
+    # Fine-tuning (unfrozen backbone)
+    print("Phase 2: Fine-tuning with unfrozen backbone...")
+    backbone.trainable = True
+    loss_fine = keras.losses.CategoricalCrossentropy(label_smoothing=LABEL_SMOOTH_FINE)
+    model.compile(
+        optimizer=keras.optimizers.AdamW(
+            learning_rate=1e-5,
+            weight_decay=0.05,
+            beta_1=0.9,
+            beta_2=0.999,
+        ),
+        loss=loss_fine,
+        metrics=["accuracy"],
+    )
+    
+    history_fine = model.fit(
+        train_ds, 
+        validation_data=val_ds, 
+        epochs=EPOCHS_FINE,
+        verbose=1
+    )
+    
+    # Evaluate on validation set
+    val_loss, val_accuracy = model.evaluate(val_ds, verbose=0)
+    print(f"Fold {fold_num + 1} - Validation Accuracy: {val_accuracy:.4f}")
+    
+    return model, val_accuracy, history_init, history_fine
+
+# Main execution -----------------------------------------------------------
+print("Loading data and creating splits...")
+
+# Generate random seeds for reproducible-yet-random splits
+RANDOM_SEED = random.randint(1, 100000)
+CV_SEED = random.randint(1, 100000)
+print(f"Using random seed {RANDOM_SEED} for train/test split")
+print(f"Using random seed {CV_SEED} for cross-validation splits")
+
+# Get all file paths and labels
+all_paths, all_labels, class_names = get_file_paths_and_labels(DATA_ROOT)
+print(f"Found {len(all_paths)} images across {len(class_names)} classes")
+print(f"Classes: {class_names}")
+
+# Initialize split tracking
+split_info = {
+    "timestamp": datetime.now().isoformat(),
+    "random_seed": RANDOM_SEED,
+    "cv_seed": CV_SEED,
+    "k_folds": K_FOLDS,
+    "split_ratios": {
+        "train": TRAIN_SPLIT,
+        "val": VAL_SPLIT,
+        "test": TEST_SPLIT
+    },
+    "class_names": class_names,
+    "total_images": len(all_paths),
+    "test_split": {},
+    "folds": []
+}
+
+# First split: separate test set (10%)
+train_val_paths, test_paths, train_val_labels, test_labels = train_test_split(
+    all_paths, all_labels, 
+    test_size=TEST_SPLIT, 
+    stratify=all_labels, 
+    random_state=RANDOM_SEED
+)
+
+# Record test split by class
+split_info["test_split"] = organize_splits_by_class(test_paths, test_labels, class_names)
+
+# Create test dataset (we'll use this at the end)
+test_ds = create_dataset_from_paths(test_paths, test_labels, class_names, is_training=False)
+
+# Persist class names
+CLASS_NAMES_TXT.write_text("\n".join(class_names) + "\n", encoding="utf‑8")
+print(f"Saved class names → {CLASS_NAMES_TXT.resolve()}")
+
+# K-Fold Cross Validation on remaining 90% of data
+print(f"\nStarting {K_FOLDS}-fold cross-validation...")
+
+# Convert labels to integers for stratified split
+label_encoder = LabelEncoder()
+train_val_int_labels = label_encoder.fit_transform(train_val_labels)
+
+# Create stratified k-fold splits
+skf = StratifiedKFold(n_splits=K_FOLDS, shuffle=True, random_state=CV_SEED)
+fold_accuracies = []
+best_model = None
+best_accuracy = 0.0
+best_fold = 0
+
+for fold_num, (train_idx, val_idx) in enumerate(skf.split(train_val_paths, train_val_int_labels)):
+    # Split data for this fold
+    fold_train_paths = [train_val_paths[i] for i in train_idx]
+    fold_train_labels = [train_val_labels[i] for i in train_idx]
+    fold_val_paths = [train_val_paths[i] for i in val_idx]
+    fold_val_labels = [train_val_labels[i] for i in val_idx]
+    
+    print(f"Fold {fold_num + 1}: {len(fold_train_paths)} train, {len(fold_val_paths)} val")
+    
+    # Record fold splits by class
+    fold_split_info = {
+        "fold_number": fold_num + 1,
+        "train_split": organize_splits_by_class(fold_train_paths, fold_train_labels, class_names),
+        "val_split": organize_splits_by_class(fold_val_paths, fold_val_labels, class_names),
+        "train_count": len(fold_train_paths),
+        "val_count": len(fold_val_paths)
+    }
+    
+    # Train model for this fold
+    model, val_accuracy, _, _ = train_model_fold(
+        fold_train_paths, fold_train_labels,
+        fold_val_paths, fold_val_labels,
+        class_names, fold_num
+    )
+    
+    # Add accuracy to fold info
+    fold_split_info["val_accuracy"] = float(val_accuracy)
+    split_info["folds"].append(fold_split_info)
+    
+    fold_accuracies.append(val_accuracy)
+    
+    # Keep track of best model
+    if val_accuracy > best_accuracy:
+        best_accuracy = val_accuracy
+        best_model = model
+        best_fold = fold_num + 1
+        print(f"New best model! Accuracy: {val_accuracy:.4f}")
+
+# Print cross-validation results
+print(f"\n=== Cross-Validation Results ===")
+print(f"Fold accuracies: {[f'{acc:.4f}' for acc in fold_accuracies]}")
+print(f"Mean CV accuracy: {np.mean(fold_accuracies):.4f} ± {np.std(fold_accuracies):.4f}")
+print(f"Best fold accuracy: {best_accuracy:.4f} (Fold {best_fold})")
+
+# Add summary statistics to split info
+split_info["summary"] = {
+    "mean_cv_accuracy": float(np.mean(fold_accuracies)),
+    "std_cv_accuracy": float(np.std(fold_accuracies)),
+    "best_fold": best_fold,
+    "best_fold_accuracy": float(best_accuracy),
+    "all_fold_accuracies": [float(acc) for acc in fold_accuracies]
+}
+
+# Final evaluation on test set
+print(f"\n=== Final Test Set Evaluation ===")
+test_loss, test_accuracy = best_model.evaluate(test_ds, verbose=1)
+print(f"Test accuracy: {test_accuracy:.4f}")
+
+# Add test results to split info
+split_info["test_results"] = {
+    "test_loss": float(test_loss),
+    "test_accuracy": float(test_accuracy)
+}
+
+# Save the best model
+best_model.save(MODEL_OUT)
+print(f"Best model saved → {MODEL_OUT.resolve()}")
+
+# Save split information (after model to ensure it completes)
+print(f"\nSaving split information...")
+save_split_info(split_info, SPLITS_LOG)
+print("Training complete!")
