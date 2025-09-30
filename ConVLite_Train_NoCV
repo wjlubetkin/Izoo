@@ -1,9 +1,13 @@
+import json
+from collections import defaultdict
+from datetime import datetime
+import random
+from pathlib import Path
+
+import keras_cv
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-import keras_cv
-import random
-from pathlib import Path
 
 """
 ConvNeXt fine‑tuning pipeline **with label smoothing**
@@ -32,6 +36,7 @@ EPOCHS_FINE = 10
 MODEL_OUT      = Path("convnext_finetuned_labelsmoothNOCV.keras")
 CLASS_NAMES_TXT = MODEL_OUT.with_suffix(".classes.txt")
 SEED = random.randint(1, 1000)
+CV_SEED = SEED  # No CV in this script, but keep a record for parity with CV pipeline
 
 AUTOTUNE = tf.data.AUTOTUNE
 RAND_AUG = keras_cv.layers.RandAugment(value_range=(0, 255))
@@ -40,7 +45,7 @@ RAND_AUG = keras_cv.layers.RandAugment(value_range=(0, 255))
 # Dataset -----------------------------------------------------------------
 
 def build_dataset(root: Path, validation_split: float = 0.0, subset: str | None = None):
-    """Return (dataset, class_names)."""
+    """Return (dataset, class_names, file_paths)."""
     ds = tf.keras.utils.image_dataset_from_directory(
         root,
         labels="inferred",
@@ -56,16 +61,25 @@ def build_dataset(root: Path, validation_split: float = 0.0, subset: str | None 
 
     class_names = tuple(ds.class_names)  # immutable copy
     num_classes = len(class_names)
+    file_paths = tuple(ds.file_paths)
 
     # Cast to float32 (keep 0‑255 range) and one‑hot encode labels for CCE.
     ds = ds.map(
         lambda x, y: (tf.cast(x, tf.float32), tf.one_hot(y, num_classes)),
         num_parallel_calls=AUTOTUNE,
-    )
-    return ds.cache().prefetch(AUTOTUNE), class_names
+    ).cache()
+    return ds, class_names, file_paths
 
-train_ds, CLASS_NAMES = build_dataset(DATA_ROOT, VAL_SPLIT, "training")
-val_ds, _             = build_dataset(DATA_ROOT, VAL_SPLIT, "validation")
+
+def summarize_split(file_paths: tuple[str, ...]):
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for path_str in file_paths:
+        path = Path(path_str)
+        grouped[path.parent.name].append(path.name)
+    return {cls: sorted(files) for cls, files in sorted(grouped.items())}
+
+train_ds, CLASS_NAMES, train_file_paths = build_dataset(DATA_ROOT, VAL_SPLIT, "training")
+val_ds, _, val_file_paths = build_dataset(DATA_ROOT, VAL_SPLIT, "validation")
 NUM_CLASSES = len(CLASS_NAMES)
 
 # Apply RandAugment only on the training dataset
@@ -81,6 +95,8 @@ train_ds = train_ds.map(
 
     num_parallel_calls=AUTOTUNE,
 ).prefetch(AUTOTUNE)
+
+val_ds = val_ds.prefetch(AUTOTUNE)
 
 # Persist class names ------------------------------------------------------
 CLASS_NAMES_TXT.write_text("\n".join(CLASS_NAMES) + "\n", encoding="utf‑8")
@@ -128,9 +144,31 @@ optimizer = keras.optimizers.AdamW(
     metrics=["accuracy"],
 )
 
-model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FINE)
+fine_history = model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS_FINE)
 
 # Save --------------------------------------------------------------------
 model.save(MODEL_OUT)
 print(f"Model saved → {MODEL_OUT.resolve()}")
+timestamp = datetime.now().astimezone().replace(microsecond=0)
+split_record = {
+    "timestamp": timestamp.isoformat(),
+    "random_seed": SEED,
+    "cv_seed": CV_SEED,
+    "test_split": {},
+    "folds": [
+        {
+            "fold_number": 1,
+            "train_split": summarize_split(train_file_paths),
+            "val_split": summarize_split(val_file_paths),
+            "val_accuracy": float(fine_history.history.get("val_accuracy", [None])[-1])
+            if fine_history.history.get("val_accuracy")
+            else None,
+        }
+    ],
+}
+
+log_filename = f"{MODEL_OUT.stem}_splits_{timestamp.isoformat().replace(':', '-')}.json"
+split_log_path = MODEL_OUT.with_name(log_filename)
+split_log_path.write_text(json.dumps(split_record, indent=2), encoding="utf-8")
+print(f"Saved split log → {split_log_path.resolve()}")
 print("Training complete!")
