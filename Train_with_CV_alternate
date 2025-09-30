@@ -26,7 +26,7 @@ Tested with TF‑Keras ≥ 2.19.
 
 # ---------------------------- CONFIGURATION ----------------------------------
 DATA_ROOT = Path("./IndyZooFaces")       # folder with sub‑dirs per class
-TRAIN_SPLIT = 0.75                     # 70% for training
+TRAIN_SPLIT = 0.85                     # 70% for training
 VAL_SPLIT = 0.15                      # 20% for validation  
 TEST_SPLIT = None                      # 10% for test
 K_FOLDS = 5                            # number of folds for cross-validation
