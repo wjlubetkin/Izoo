@@ -25,20 +25,20 @@ Tested with TF‑Keras ≥ 2.19.
 """
 
 # ---------------------------- CONFIGURATION ----------------------------------
-DATA_ROOT = Path("./IndyZooFaces")       # folder with sub‑dirs per class
-TRAIN_SPLIT = 0.85                     # 70% for training
-VAL_SPLIT = 0.15                      # 20% for validation  
-TEST_SPLIT = None                      # 10% for test
+DATA_ROOT = Path("./IZF_Balanced")       # folder with sub‑dirs per class
+TRAIN_SPLIT = 0.70                     # 70% for training
+VAL_SPLIT = 0.2                      # 20% for validation  
+TEST_SPLIT = 0.10                      # 10% for test
 K_FOLDS = 5                            # number of folds for cross-validation
 
 IMG_SIZE   = (224, 224)
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 
-LABEL_SMOOTH_INIT = 0.10               # heavier for warm‑up
-LABEL_SMOOTH_FINE = 0.05               # lighter for fine‑tune
+LABEL_SMOOTH_INIT = 0.00               # heavier for warm‑up
+LABEL_SMOOTH_FINE = 0.00               # lighter for fine‑tune
 
-EPOCHS_INIT = 10
-EPOCHS_FINE = 10
+EPOCHS_INIT = 20
+EPOCHS_FINE = 30
 
 MODEL_OUT      = Path("convnext_finetuned_labelsmooth_kfold.keras")
 CLASS_NAMES_TXT = MODEL_OUT.with_suffix(".classes.txt")
@@ -128,7 +128,7 @@ def create_dataset_from_paths(file_paths, labels, class_names, is_training=False
 
 def create_model(num_classes):
     """Create and compile the ConvNeXt model."""
-    backbone = keras.applications.ConvNeXtBase(
+    backbone = keras.applications.ConvNeXtLarge(
         include_top=False,
         weights="imagenet",
         include_preprocessing=True,   # built‑in Normalization layer
@@ -136,7 +136,7 @@ def create_model(num_classes):
         pooling="avg",               # global average pool
     )
     
-    x = layers.Dropout(0.2)(backbone.output)
+    x = layers.Dropout(0.3)(backbone.output)
     outputs = layers.Dense(num_classes, activation="softmax")(x)
     model = keras.Model(backbone.input, outputs, name="convnext_finetune")
     
